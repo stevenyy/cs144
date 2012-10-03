@@ -19,6 +19,8 @@
 #define PAYLOAD_MAX_SIZE 500
 #define PACKET_HEADER_SIZE 12
 #define ACK_PACKET_SIZE 8
+#define MILLISECONDS_IN_SECOND 1000
+#define MICROSECONDS_IN_MILLISECOND 1000
 
 enum transmitter_state{
   WAITING_INPUT_DATA, WAITING_ACK, WAITING_EOF_ACK, FINISHED
@@ -31,11 +33,14 @@ struct reliable_state {
   conn_t *c;			/* This is the connection object */
 
   /* Add your own data fields below this */
+  int timeout;
 
   /* State for the transmitting piece */
   enum transmitter_state transmitterState;
-  uint8_t lastPacketSent[PACKET_MAX_SIZE];
+  packet_t lastPacketSent; /* keeps a copy of last packet sent as passed to conn_sendpkt */
+  size_t lengthLastPacketSent; 
   uint32_t lastAckedSeqNumber;
+  struct timeval lastTransmissionTime;
 };
 
 rel_t *rel_list;
@@ -53,6 +58,9 @@ void convert_packet_to_host_byte_order (packet_t *packet);
 void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
 void process_received_data_packet (rel_t *relState, packet_t *packet);
 void process_ack (rel_t *relState, packet_t *packet_t);
+void handle_retransmission(rel_t *relState);
+int getTimeSinceLastTransmission (rel_t *relState);
+
 
 
 /* Creates a new reliable protocol session, returns NULL on failure.
@@ -87,6 +95,7 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 
   r->transmitterState = WAITING_INPUT_DATA;
   r->lastAckedSeqNumber = 0;
+  r->timeout = cc->timeout;
 
   return r;
 }
@@ -147,7 +156,6 @@ rel_read (rel_t *relState)
     if (packet != NULL)
     {
       int packetLength = packet->len;
-      memcpy (relState->lastPacketSent, packet, packetLength);
 
       /* change transmitter state according to whether we are sending EOF packet or normal packet
          (if there is no payload then we are sending EOF packet) */
@@ -160,6 +168,11 @@ rel_read (rel_t *relState)
 
       prepare_for_transmission (packet);
       conn_sendpkt (relState->c, packet, (size_t) packetLength);
+
+      /* keep record of the last packet sent */
+      memcpy (&(relState->lastPacketSent), packet, packetLength); 
+      relState->lengthLastPacketSent = (size_t) packetLength;
+      gettimeofday(&(relState->lastTransmissionTime), NULL); /* record the time of transmission */
 
       free (packet);
     }
@@ -175,7 +188,14 @@ void
 rel_timer ()
 {
   /* Retransmit any packets that need to be retransmitted */
+  rel_t *r = rel_list;
 
+  /* go through every open reliable connection and retransmit packets as needed */ 
+  while(r)
+  {
+    handle_retransmission(r);
+    r = r->next;
+  }
 }
 
 
@@ -309,33 +329,10 @@ convert_packet_to_host_byte_order (packet_t *packet)
     packet->seqno = ntohl (packet->seqno);
 }
 
-/*
-  This function processes received ack only packets which have passed the corruption check 
-*/
 void 
 process_received_ack_packet (rel_t *relState, struct ack_packet *packet)
 {
   process_ack (relState, (packet_t*) packet);
-  // /* proceed only if we are waiting for an ack */ 
-  // if (relState->transmitterState == WAITING_ACK)
-  // {
-  //   /* received ack for last normal packet sent, go back to waiting for input 
-  //      and try to read */
-  //   if (packet->ackno == relState->lastAckedSeqNumber + 1)
-  //   {
-  //     relState->transmitterState = WAITING_INPUT_DATA;
-  //     rel_read(relState);
-  //   }
-  // }
-  // else if (relState->transmitterState == WAITING_EOF_ACK)
-  // {
-  //   /* received ack for EOF packet, enter closed connection state */
-  //   if (packet->ackno == relState->lastAckedSeqNumber + 1)
-  //   {
-  //     relState->transmitterState = FINISHED;
-  //   } 
-  // }
-  // TODO: clean up above mess
 }
 
 void 
@@ -346,6 +343,9 @@ process_received_data_packet (rel_t *relState, packet_t *packet)
   process_ack(relState, packet);
 }
 
+/*
+  This function processes received ack only packets which have passed the corruption check 
+*/
 void 
 process_ack (rel_t *relState, packet_t *packet)
 {
@@ -368,4 +368,34 @@ process_ack (rel_t *relState, packet_t *packet)
       relState->transmitterState = FINISHED;
     } 
   }
+}
+
+void 
+handle_retransmission (rel_t *relState)
+{
+  if (relState->transmitterState == WAITING_ACK || relState->transmitterState == WAITING_EOF_ACK)
+  {
+    int millisecondsSinceTransmission = getTimeSinceLastTransmission (relState);
+
+    /* last transmission timed out, retransmit last packet*/
+    if (millisecondsSinceTransmission > relState->timeout) 
+    {
+      conn_sendpkt (relState->c, &(relState->lastPacketSent), relState->lengthLastPacketSent);
+      gettimeofday(&(relState->lastTransmissionTime), NULL); /* record retransmission time */
+    }
+  }
+}
+
+/*
+  This function returns the time interval, in milliseconds, between the time the last packet 
+  was transmitted and now. 
+*/
+int 
+getTimeSinceLastTransmission (rel_t *relState)
+{
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  
+  return ( ( (int)now.tv_sec * 1000 + (int)now.tv_usec / 1000 ) - 
+  ( (int)relState->lastTransmissionTime.tv_sec * 1000 + (int)relState->lastTransmissionTime.tv_usec / 1000 ) );
 }
