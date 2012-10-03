@@ -18,6 +18,7 @@
 #define PACKET_MAX_SIZE 512
 #define PAYLOAD_MAX_SIZE 500
 #define PACKET_HEADER_SIZE 12
+#define ACK_PACKET_SIZE 8
 
 enum transmitter_state{
   WAITING_INPUT_DATA, WAITING_ACK, WAITING_EOF_ACK, FINISHED
@@ -36,6 +37,7 @@ struct reliable_state {
   uint8_t lastPacketSent[PACKET_MAX_SIZE];
   uint32_t lastAckedSeqNumber;
 };
+
 rel_t *rel_list;
 
 
@@ -46,8 +48,11 @@ packet_t *create_packet_from_input (rel_t *relState);
 void prepare_for_transmission (packet_t *packet);
 void convert_packet_to_network_byte_order (packet_t *packet);
 uint16_t compute_checksum (packet_t *packet, int packetLength);
-
-
+int is_packet_corrupted(packet_t *packet, size_t received_length);
+void convert_packet_to_host_byte_order (packet_t *packet); 
+void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
+void process_received_data_packet (rel_t *relState, packet_t *packet);
+void process_ack (rel_t *relState, packet_t *packet_t);
 
 
 /* Creates a new reliable protocol session, returns NULL on failure.
@@ -114,8 +119,18 @@ rel_demux (const struct config_common *cc,
 }
 
 void
-rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
+rel_recvpkt (rel_t *relState, packet_t *packet, size_t received_length)
 {
+  // IMPLEMENTATION NOTES: cannot assume pkt will persist in memory beyond the function call, its memory is 'borrowed'
+  if (is_packet_corrupted (packet, received_length)) /* do not do anything if packet is corrupted */
+    return;
+
+  convert_packet_to_host_byte_order (packet); 
+
+  if (packet->len == ACK_PACKET_SIZE)
+    process_received_ack_packet (relState, (struct ack_packet*) packet);
+  else
+    process_received_data_packet (relState, packet);
 }
 
 
@@ -141,7 +156,7 @@ rel_read (rel_t *relState)
       {
         fprintf (stderr, "Created a malformed packet of length %d inside rel_read. Aborting. \n", packetLength);
         abort ();
-      }
+      } // TODO: delete this internal check eventually
 
       prepare_for_transmission (packet);
       conn_sendpkt (relState->c, packet, (size_t) packetLength);
@@ -214,6 +229,8 @@ create_packet_from_input (rel_t *relState)
   This function takes a packet and gets it ready for transmission over UDP. 
   Specifically it first converts all necessary fields to network byte order
   and then computes and writes the checksum to the cksum field.
+  NOTE: this function works for data packets as well as ack only packets, i.e. packet
+  could really be a packet_t* or a struct ack_packet*.
 */
 void 
 prepare_for_transmission (packet_t *packet)
@@ -221,28 +238,134 @@ prepare_for_transmission (packet_t *packet)
   int packetLength = (int)(packet->len);
 
   convert_packet_to_network_byte_order (packet);
-  uint16_t checksum = compute_checksum (packet, packetLength);
-  packet->cksum = checksum;
+  packet->cksum = compute_checksum (packet, packetLength);
 }
 
 /* 
   This function takes a packet and converts all necessary fields to network byte order.
+  NOTE: this function works for data packets as well as ack only packets, i.e. packet
+  could really be a packet_t* or a struct ack_packet*.
 */
 void 
 convert_packet_to_network_byte_order (packet_t *packet)
 {
+  /* if the packet is a data packet it also has a seqno that has to be converted to 
+     network byte order */
+  if (packet->len != ACK_PACKET_SIZE) 
+    packet->seqno = htonl (packet->seqno);
+
   packet->len = htons (packet->len);
-  packet->ackno = htonl (packet->ackno);
-  packet->seqno = htonl (packet->seqno);
+  packet->ackno = htonl (packet->ackno);  
 }
 
 /* 
   Returns the cksum of a packet. Need packetLength as an parameter since the packet's len
   field may already be in network byte order. 
+  NOTE: this function works for data packets as well as ack only packets, i.e. packet
+  could really be a packet_t* or a struct ack_packet*.
 */
 uint16_t 
 compute_checksum (packet_t *packet, int packetLength)
 {  
   memset (&(packet->cksum), 0, sizeof (packet->cksum)); // TODO: test
   return cksum ((void*)packet, packetLength);
+}
+
+/* 
+  Function checks if a packet is corrupted by computing its checksum and comparing
+  to the checksum in the packet. Returns 1 if packet is corrupted and 0 if it is not. 
+  NOTE: this function works for data packets as well as ack only packets, i.e. packet
+  could really be a packet_t* or a struct ack_packet*.
+*/
+int 
+is_packet_corrupted(packet_t *packet, size_t received_length)
+{
+  int packetLength = (int) ntohs (packet->len);
+
+  /* If we received fewer bytes than the packet's size declare corruption. */
+  if (received_length < (size_t)packetLength) 
+    return 1;
+
+  uint16_t packetChecksum = packet->cksum;
+  uint16_t computedChecksum = compute_checksum (packet, packetLength);
+
+  return packetChecksum != computedChecksum;
+}
+
+/* 
+  This function takes a packet and converts all necessary fields to host byte order.
+  NOTE: this function works for data packets as well as ack only packets, i.e. packet
+  could really be a packet_t* or a struct ack_packet*.
+*/
+void 
+convert_packet_to_host_byte_order (packet_t *packet)
+{
+  packet->len = ntohs (packet->len);
+  packet->ackno = ntohl (packet->ackno);
+  
+  /* if the packet is a data packet it additionally has a seqno that has 
+     to be converted to host byte order */
+  if (packet->len != ACK_PACKET_SIZE) 
+    packet->seqno = ntohl (packet->seqno);
+}
+
+/*
+  This function processes received ack only packets which have passed the corruption check 
+*/
+void 
+process_received_ack_packet (rel_t *relState, struct ack_packet *packet)
+{
+  process_ack (relState, (packet_t*) packet);
+  // /* proceed only if we are waiting for an ack */ 
+  // if (relState->transmitterState == WAITING_ACK)
+  // {
+  //   /* received ack for last normal packet sent, go back to waiting for input 
+  //      and try to read */
+  //   if (packet->ackno == relState->lastAckedSeqNumber + 1)
+  //   {
+  //     relState->transmitterState = WAITING_INPUT_DATA;
+  //     rel_read(relState);
+  //   }
+  // }
+  // else if (relState->transmitterState == WAITING_EOF_ACK)
+  // {
+  //   /* received ack for EOF packet, enter closed connection state */
+  //   if (packet->ackno == relState->lastAckedSeqNumber + 1)
+  //   {
+  //     relState->transmitterState = FINISHED;
+  //   } 
+  // }
+  // TODO: clean up above mess
+}
+
+void 
+process_received_data_packet (rel_t *relState, packet_t *packet)
+{
+  // TODO: first process data part as the receiver and possibly update ack in relState for 
+  //       piggybacking ack to packet sent by transmitter 
+  process_ack(relState, packet);
+}
+
+void 
+process_ack (rel_t *relState, packet_t *packet)
+{
+  /* proceed only if we are waiting for an ack */ 
+  if (relState->transmitterState == WAITING_ACK)
+  {
+    /* received ack for last normal packet sent, go back to waiting for input 
+       and try to read */
+    if (packet->ackno == relState->lastAckedSeqNumber + 1)
+    {
+      relState->transmitterState = WAITING_INPUT_DATA;
+      rel_read(relState);
+    }
+  }
+  else if (relState->transmitterState == WAITING_EOF_ACK)
+  {
+    /* received ack for EOF packet, enter closed connection state */
+    if (packet->ackno == relState->lastAckedSeqNumber + 1)
+    {
+      relState->transmitterState = FINISHED;
+    } 
+  }
 }
