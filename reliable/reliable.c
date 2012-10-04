@@ -48,6 +48,7 @@ struct reliable_state {
 
   /* State for the server */
   enum server_state serverState;
+  uint32_t nextInOrderSeqNo; /* The sequence number of the next in-order packet we expect to receive. */
 };
 
 rel_t *rel_list;
@@ -67,6 +68,10 @@ void process_received_data_packet (rel_t *relState, packet_t *packet);
 void process_ack (rel_t *relState, packet_t *packet_t);
 void handle_retransmission(rel_t *relState);
 int getTimeSinceLastTransmission (rel_t *relState);
+void process_data_packet (rel_t *relState, packet_t *packet);
+void create_and_send_ack_packet (rel_t *relState, uint32_t ackno);
+struct ack_packet *create_ack_packet (uint32_t ackno);
+
 
 
 
@@ -100,9 +105,15 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 
   /* Do any other initialization you need here */
 
+  r->timeout = cc->timeout;
+
+  /* Client initialization */
   r->clientState = WAITING_INPUT_DATA;
   r->lastAckedSeqNumber = 0;
-  r->timeout = cc->timeout;
+
+  /* Server initialization */
+  r->serverState = WAITING_DATA_PACKET;
+  r->nextInOrderSeqNo = 1;
 
   return r;
 }
@@ -346,10 +357,14 @@ process_received_ack_packet (rel_t *relState, struct ack_packet *packet)
 void 
 process_received_data_packet (rel_t *relState, packet_t *packet)
 {
-  // TODO: ignore out of order packets
-  // TODO: first process data part as the receiver and possibly update ack in relState for 
-  //       piggybacking ack to packet sent by client 
-  process_ack(relState, packet);
+  /* Server piece should process the data part of the packet and client piece
+     should process part the ack part of the packet. */  
+
+  /* Pass the packet to the server piece to process the data packet */
+  process_data_packet(relState, packet);
+
+  /* Pass the packet to the client piece to process the ackno field */
+  process_ack (relState, packet);
 }
 
 /*
@@ -383,6 +398,23 @@ process_ack (rel_t *relState, packet_t *packet)
   }
 }
 
+void
+process_data_packet (rel_t *relState, packet_t *packet)
+{
+  /* if we receive a packet we have seen and processed before then just send an ack back
+     regardless on which state the server is in */
+  if (packet->seqno < relState->nextInOrderSeqNo)
+    create_and_send_ack_packet (relState, packet->seqno + 1);
+
+  /* if we have received the next in-order packet we were expecting then process it 
+    accordingly */
+  if (packet->seqno == relState->nextInOrderSeqNo)
+  {
+    // TODO: process data packet in the 
+  }
+    
+}
+
 void 
 handle_retransmission (rel_t *relState)
 {
@@ -411,4 +443,26 @@ getTimeSinceLastTransmission (rel_t *relState)
   
   return ( ( (int)now.tv_sec * 1000 + (int)now.tv_usec / 1000 ) - 
   ( (int)relState->lastTransmissionTime.tv_sec * 1000 + (int)relState->lastTransmissionTime.tv_usec / 1000 ) );
+}
+
+void
+create_and_send_ack_packet (rel_t *relState, uint32_t ackno)
+{
+  struct ack_packet *ackPacket = create_ack_packet (ackno);
+  int packetLength = ackPacket->len;
+  prepare_for_transmission ((packet_t*)ackPacket);
+  conn_sendpkt (relState->c, (packet_t*)ackPacket, (size_t) packetLength);
+  free(ackPacket);
+}
+
+struct ack_packet *
+create_ack_packet (uint32_t ackno)
+{
+  struct ack_packet *ackPacket;
+  ackPacket = xmalloc (sizeof (*ackPacket));
+
+  ackPacket->len = (uint16_t)ACK_PACKET_SIZE;
+  ackPacket->ackno = ackno;
+  
+  return ackPacket;
 }
