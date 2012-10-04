@@ -23,12 +23,12 @@
 #define MICROSECONDS_IN_MILLISECOND 1000
 
 enum client_state{
-  WAITING_INPUT_DATA, WAITING_ACK, WAITING_EOF_ACK, FINISHED
+  WAITING_INPUT_DATA, WAITING_ACK, WAITING_EOF_ACK, CLIENT_FINISHED
 };
 
-enum serverState{
-  WAITING_DATA_PACKET, WAITING_TO_FLUSH_DATA, FINISHED
-}
+enum server_state{
+  WAITING_DATA_PACKET, WAITING_TO_FLUSH_DATA, SERVER_FINISHED
+};
 
 struct reliable_state {
   rel_t *next;			/* Linked list for traversing all connections */
@@ -233,7 +233,7 @@ create_packet_from_input (rel_t *relState)
   packet = xmalloc (sizeof (*packet));
 
   /* try to read one full packet's worth of data from input */
-  uint16_t bytesRead = conn_input (relState->c, packet->data, PAYLOAD_MAX_SIZE);
+  int bytesRead = conn_input (relState->c, packet->data, PAYLOAD_MAX_SIZE);
 
   if (bytesRead == 0) /* there is no input, don't create a packet */
   {
@@ -374,10 +374,10 @@ process_ack (rel_t *relState, packet_t *packet)
     /* received ack for EOF packet, enter declare client connection to be finished */
     if (packet->ackno == relState->lastAckedSeqNumber + 1)
     {
-      relState->clientState = FINISHED;
+      relState->clientState = CLIENT_FINISHED;
 
       /* destroy the connection only if the other side's client has finished */
-      if (relState->serverState == FINISHED)
+      if (relState->serverState == SERVER_FINISHED)
         rel_destroy(relState);
     } 
   }
