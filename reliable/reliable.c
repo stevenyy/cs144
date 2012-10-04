@@ -189,12 +189,7 @@ rel_read (rel_t *relState)
       /* change client state according to whether we are sending EOF packet or normal packet
          (if there is no payload then we are sending EOF packet) */
       relState->clientState = (packetLength == PACKET_HEADER_SIZE) ? WAITING_EOF_ACK : WAITING_ACK;
-      if (packetLength < PACKET_HEADER_SIZE)
-      {
-        fprintf (stderr, "Created a malformed packet of length %d inside rel_read. Aborting. \n", packetLength);
-        abort ();
-      } // TODO: delete this internal check eventually
-
+      
       prepare_for_transmission (packet);
       conn_sendpkt (relState->c, packet, (size_t) packetLength);
 
@@ -278,7 +273,7 @@ create_packet_from_input (rel_t *relState)
      that should be declared in the len field */
   packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
                                     (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
-  packet->ackno = (uint32_t) 1; // TODO: write appropriate ackno here
+  packet->ackno = (uint32_t) 1; /* not piggybacking acks, don't ack any packets */
   packet->seqno = (uint32_t) (relState->seqnoLastPacketSent + 1);
 
   return packet;
