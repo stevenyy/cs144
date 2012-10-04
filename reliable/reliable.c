@@ -44,7 +44,7 @@ struct reliable_state {
   enum client_state clientState;
   packet_t lastPacketSent; /* keeps a copy of last packet sent as passed to conn_sendpkt */
   size_t lengthLastPacketSent; 
-  uint32_t lastAckedSeqNumber;
+  uint32_t seqnoLastPacketSent;
   struct timeval lastTransmissionTime;
 
   /* State for the server */
@@ -117,7 +117,7 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 
   /* Client initialization */
   r->clientState = WAITING_INPUT_DATA;
-  r->lastAckedSeqNumber = 0;
+  r->seqnoLastPacketSent = 0;
 
   /* Server initialization */
   r->serverState = WAITING_DATA_PACKET;
@@ -160,7 +160,6 @@ rel_demux (const struct config_common *cc,
 void
 rel_recvpkt (rel_t *relState, packet_t *packet, size_t received_length)
 {
-  // IMPLEMENTATION NOTES: cannot assume pkt will persist in memory beyond the function call, its memory is 'borrowed'
   if (is_packet_corrupted (packet, received_length)) /* do not do anything if packet is corrupted */
     return;
 
@@ -202,6 +201,7 @@ rel_read (rel_t *relState)
       /* keep record of the last packet sent */
       memcpy (&(relState->lastPacketSent), packet, packetLength); 
       relState->lengthLastPacketSent = (size_t) packetLength;
+      relState->seqnoLastPacketSent += 1;
       gettimeofday(&(relState->lastTransmissionTime), NULL); /* record the time of transmission */
 
       free (packet);
@@ -272,15 +272,14 @@ create_packet_from_input (rel_t *relState)
     free(packet);
     return NULL;
   }
-  else /* there is some input, create a packet */
-  {
-    /* if we read an EOF create a zero byte payload, otherwise we read normal bytes
-       that should be declared in the len field */
-    packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
-                                      (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
-  }
+  /* else there is some input, so create a packet */
+
+  /* if we read an EOF create a zero byte payload, otherwise we read normal bytes
+     that should be declared in the len field */
+  packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
+                                    (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
   packet->ackno = (uint32_t) 1; // TODO: write appropriate ackno here
-  packet->seqno = (uint32_t) (relState->lastAckedSeqNumber + 1);
+  packet->seqno = (uint32_t) (relState->seqnoLastPacketSent + 1);
 
   return packet;
 }
@@ -400,7 +399,7 @@ process_ack (rel_t *relState, packet_t *packet)
   {
     /* received ack for last normal packet sent, go back to waiting for input 
        and try to read */
-    if (packet->ackno == relState->lastAckedSeqNumber + 1)
+    if (packet->ackno == relState->seqnoLastPacketSent + 1)
     {
       relState->clientState = WAITING_INPUT_DATA;
       rel_read(relState);
@@ -409,7 +408,7 @@ process_ack (rel_t *relState, packet_t *packet)
   else if (relState->clientState == WAITING_EOF_ACK)
   {
     /* received ack for EOF packet, enter declare client connection to be finished */
-    if (packet->ackno == relState->lastAckedSeqNumber + 1)
+    if (packet->ackno == relState->seqnoLastPacketSent + 1)
     {
       relState->clientState = CLIENT_FINISHED;
 
