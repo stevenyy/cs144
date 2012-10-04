@@ -18,6 +18,7 @@
 #define PACKET_MAX_SIZE 512
 #define PAYLOAD_MAX_SIZE 500
 #define PACKET_HEADER_SIZE 12
+#define EOF_PACKET_SIZE 12
 #define ACK_PACKET_SIZE 8
 #define MILLISECONDS_IN_SECOND 1000
 #define MICROSECONDS_IN_MILLISECOND 1000
@@ -49,6 +50,10 @@ struct reliable_state {
   /* State for the server */
   enum server_state serverState;
   uint32_t nextInOrderSeqNo; /* The sequence number of the next in-order packet we expect to receive. */
+  uint8_t lastReceivedPacketPayload[PAYLOAD_MAX_SIZE]; /* buffer for the last received packet's payload */
+  uint32_t lastReceivedPacketSeqno;
+  uint16_t lastReceivedPayloadSize; /* size of the last received packet's payload */
+  uint16_t numFlushedBytes; /* number of bytes of lastReceivedPacketPayload that have been flushed out to conn_output  */
 };
 
 rel_t *rel_list;
@@ -71,6 +76,9 @@ int getTimeSinceLastTransmission (rel_t *relState);
 void process_data_packet (rel_t *relState, packet_t *packet);
 void create_and_send_ack_packet (rel_t *relState, uint32_t ackno);
 struct ack_packet *create_ack_packet (uint32_t ackno);
+void savePacketInfo(rel_t *relState, packet_t *packet);
+int flushPayloadToOutput(rel_t *relState);
+
 
 
 
@@ -114,6 +122,9 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   /* Server initialization */
   r->serverState = WAITING_DATA_PACKET;
   r->nextInOrderSeqNo = 1;
+  r->numFlushedBytes = 0;
+  r->lastReceivedPayloadSize = 0;
+  r->lastReceivedPacketSeqno = 0;
 
   return r;
 }
@@ -199,8 +210,18 @@ rel_read (rel_t *relState)
 }
 
 void
-rel_output (rel_t *r)
+rel_output (rel_t *relState)
 {
+  // TODO comment
+  if (relState->serverState == WAITING_TO_FLUSH_DATA)
+  {
+    if (flushPayloadToOutput(relState))
+    {
+      create_and_send_ack_packet(relState, relState->lastReceivedPacketSeqno + 1);
+      relState->nextInOrderSeqNo = relState->lastReceivedPacketSeqno + 1;
+      relState->serverState = WAITING_DATA_PACKET;
+    }
+  }
 }
 
 void
@@ -368,7 +389,8 @@ process_received_data_packet (rel_t *relState, packet_t *packet)
 }
 
 /*
-  This function processes received ack only packets which have passed the corruption check 
+  This function processes received ack only packets which have passed the corruption check. 
+  This functionality belongs to the client piece.  
 */
 void 
 process_ack (rel_t *relState, packet_t *packet)
@@ -398,6 +420,7 @@ process_ack (rel_t *relState, packet_t *packet)
   }
 }
 
+/* This function processes a data packet. This is functionality of the server piece. */ 
 void
 process_data_packet (rel_t *relState, packet_t *packet)
 {
@@ -406,13 +429,69 @@ process_data_packet (rel_t *relState, packet_t *packet)
   if (packet->seqno < relState->nextInOrderSeqNo)
     create_and_send_ack_packet (relState, packet->seqno + 1);
 
-  /* if we have received the next in-order packet we were expecting then process it 
-    accordingly */
-  if (packet->seqno == relState->nextInOrderSeqNo)
+  /* if we have received the next in-order packet we were expecting and we are waiting 
+     for data packets process the packet */
+  if ( (packet->seqno == relState->nextInOrderSeqNo) && (relState->serverState == WAITING_DATA_PACKET) )
   {
-    // TODO: process data packet in the 
+    /* if we received an EOF packet close the connection */
+    if (packet->len == EOF_PACKET_SIZE)
+    {
+      conn_output(relState->c, NULL, 0);
+      create_and_send_ack_packet (relState, packet->seqno + 1);
+      relState->serverState = SERVER_FINISHED;
+    }
+    /* we receive a non-EOF data packet, so try to flush it to conn_output */
+    else
+    {
+      savePacketInfo(relState, packet);
+      
+      if (flushPayloadToOutput(relState))
+      {
+        create_and_send_ack_packet(relState, packet->seqno + 1);
+        relState->nextInOrderSeqNo = packet->seqno + 1;
+      }
+      else
+      {
+        relState->serverState = WAITING_TO_FLUSH_DATA;
+      }
+    }
   }
-    
+}
+
+// TODO: comment
+void
+savePacketInfo(rel_t *relState, packet_t *packet)
+{  
+  uint16_t payloadSize = packet->len - PACKET_HEADER_SIZE;
+
+  memcpy (&(relState->lastReceivedPacketPayload), &(packet->data), payloadSize);
+  relState->lastReceivedPayloadSize = payloadSize;
+  relState->lastReceivedPacketSeqno = packet->seqno;
+  relState->numFlushedBytes = 0;
+}
+
+// TODO: comment
+int
+flushPayloadToOutput(rel_t *relState)
+{
+  size_t bufferSpace = conn_bufspace(relState->c);
+  
+  if (bufferSpace == 0)
+    return 0;
+
+  size_t bytesLeft = relState->lastReceivedPayloadSize - relState->numFlushedBytes;
+  size_t writeLength = (bytesLeft < bufferSpace) ? bytesLeft : bufferSpace;
+  uint8_t *payload = relState->lastReceivedPacketPayload;
+  uint16_t offset = relState->numFlushedBytes;
+
+  int bytesWritten = conn_output(relState->c, &payload[offset], writeLength);
+
+  relState->numFlushedBytes += bytesWritten;
+
+  if (relState->numFlushedBytes == relState->lastReceivedPayloadSize)
+    return 1;
+
+  return 0;
 }
 
 void 
