@@ -26,6 +26,10 @@ enum client_state{
   WAITING_INPUT_DATA, WAITING_ACK, WAITING_EOF_ACK, FINISHED
 };
 
+enum serverState{
+  WAITING_DATA_PACKET, WAITING_TO_FLUSH_DATA, FINISHED
+}
+
 struct reliable_state {
   rel_t *next;			/* Linked list for traversing all connections */
   rel_t **prev;
@@ -35,12 +39,15 @@ struct reliable_state {
   /* Add your own data fields below this */
   int timeout;
 
-  /* State for the client piece */
+  /* State for the client */
   enum client_state clientState;
   packet_t lastPacketSent; /* keeps a copy of last packet sent as passed to conn_sendpkt */
   size_t lengthLastPacketSent; 
   uint32_t lastAckedSeqNumber;
   struct timeval lastTransmissionTime;
+
+  /* State for the server */
+  enum server_state serverState;
 };
 
 rel_t *rel_list;
@@ -109,6 +116,7 @@ rel_destroy (rel_t *r)
   conn_destroy (r->c);
 
   /* Free any other allocated memory here */
+  free(r);
 }
 
 
@@ -363,10 +371,14 @@ process_ack (rel_t *relState, packet_t *packet)
   }
   else if (relState->clientState == WAITING_EOF_ACK)
   {
-    /* received ack for EOF packet, enter closed connection state */
+    /* received ack for EOF packet, enter declare client connection to be finished */
     if (packet->ackno == relState->lastAckedSeqNumber + 1)
     {
       relState->clientState = FINISHED;
+
+      /* destroy the connection only if the other side's client has finished */
+      if (relState->serverState == FINISHED)
+        rel_destroy(relState);
     } 
   }
 }
