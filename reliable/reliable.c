@@ -22,7 +22,7 @@
 #define MILLISECONDS_IN_SECOND 1000
 #define MICROSECONDS_IN_MILLISECOND 1000
 
-enum transmitter_state{
+enum client_state{
   WAITING_INPUT_DATA, WAITING_ACK, WAITING_EOF_ACK, FINISHED
 };
 
@@ -35,8 +35,8 @@ struct reliable_state {
   /* Add your own data fields below this */
   int timeout;
 
-  /* State for the transmitting piece */
-  enum transmitter_state transmitterState;
+  /* State for the client piece */
+  enum client_state clientState;
   packet_t lastPacketSent; /* keeps a copy of last packet sent as passed to conn_sendpkt */
   size_t lengthLastPacketSent; 
   uint32_t lastAckedSeqNumber;
@@ -93,7 +93,7 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 
   /* Do any other initialization you need here */
 
-  r->transmitterState = WAITING_INPUT_DATA;
+  r->clientState = WAITING_INPUT_DATA;
   r->lastAckedSeqNumber = 0;
   r->timeout = cc->timeout;
 
@@ -146,7 +146,7 @@ rel_recvpkt (rel_t *relState, packet_t *packet, size_t received_length)
 void
 rel_read (rel_t *relState)
 {
-  if (relState->transmitterState == WAITING_INPUT_DATA)
+  if (relState->clientState == WAITING_INPUT_DATA)
   {
     /* try to read from input and create a packet */
     packet_t *packet = create_packet_from_input (relState);
@@ -157,9 +157,9 @@ rel_read (rel_t *relState)
     {
       int packetLength = packet->len;
 
-      /* change transmitter state according to whether we are sending EOF packet or normal packet
+      /* change client state according to whether we are sending EOF packet or normal packet
          (if there is no payload then we are sending EOF packet) */
-      relState->transmitterState = (packetLength == PACKET_HEADER_SIZE) ? WAITING_EOF_ACK : WAITING_ACK;
+      relState->clientState = (packetLength == PACKET_HEADER_SIZE) ? WAITING_EOF_ACK : WAITING_ACK;
       if (packetLength < PACKET_HEADER_SIZE)
       {
         fprintf (stderr, "Created a malformed packet of length %d inside rel_read. Aborting. \n", packetLength);
@@ -338,8 +338,9 @@ process_received_ack_packet (rel_t *relState, struct ack_packet *packet)
 void 
 process_received_data_packet (rel_t *relState, packet_t *packet)
 {
+  // TODO: ignore out of order packets
   // TODO: first process data part as the receiver and possibly update ack in relState for 
-  //       piggybacking ack to packet sent by transmitter 
+  //       piggybacking ack to packet sent by client 
   process_ack(relState, packet);
 }
 
@@ -350,22 +351,22 @@ void
 process_ack (rel_t *relState, packet_t *packet)
 {
   /* proceed only if we are waiting for an ack */ 
-  if (relState->transmitterState == WAITING_ACK)
+  if (relState->clientState == WAITING_ACK)
   {
     /* received ack for last normal packet sent, go back to waiting for input 
        and try to read */
     if (packet->ackno == relState->lastAckedSeqNumber + 1)
     {
-      relState->transmitterState = WAITING_INPUT_DATA;
+      relState->clientState = WAITING_INPUT_DATA;
       rel_read(relState);
     }
   }
-  else if (relState->transmitterState == WAITING_EOF_ACK)
+  else if (relState->clientState == WAITING_EOF_ACK)
   {
     /* received ack for EOF packet, enter closed connection state */
     if (packet->ackno == relState->lastAckedSeqNumber + 1)
     {
-      relState->transmitterState = FINISHED;
+      relState->clientState = FINISHED;
     } 
   }
 }
@@ -373,7 +374,7 @@ process_ack (rel_t *relState, packet_t *packet)
 void 
 handle_retransmission (rel_t *relState)
 {
-  if (relState->transmitterState == WAITING_ACK || relState->transmitterState == WAITING_EOF_ACK)
+  if (relState->clientState == WAITING_ACK || relState->clientState == WAITING_EOF_ACK)
   {
     int millisecondsSinceTransmission = getTimeSinceLastTransmission (relState);
 
