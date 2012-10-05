@@ -193,6 +193,7 @@ rel_read (rel_t *relState)
       prepare_for_transmission (packet);
       conn_sendpkt (relState->c, packet, (size_t) packetLength);
 
+      // TODO: factor out
       /* keep record of the last packet sent */
       memcpy (&(relState->lastPacketSent), packet, packetLength); 
       relState->lengthLastPacketSent = (size_t) packetLength;
@@ -321,7 +322,7 @@ convert_packet_to_network_byte_order (packet_t *packet)
 uint16_t 
 compute_checksum (packet_t *packet, int packetLength)
 {  
-  memset (&(packet->cksum), 0, sizeof (packet->cksum)); // TODO: test
+  memset (&(packet->cksum), 0, sizeof (packet->cksum));
   return cksum ((void*)packet, packetLength);
 }
 
@@ -407,7 +408,7 @@ process_ack (rel_t *relState, packet_t *packet)
     {
       relState->clientState = CLIENT_FINISHED;
 
-      /* destroy the connection only if the other side's client has finished */
+      /* destroy the connection only if the other side's client has finished transmitting */
       if (relState->serverState == SERVER_FINISHED)
         rel_destroy(relState);
     } 
@@ -427,12 +428,16 @@ process_data_packet (rel_t *relState, packet_t *packet)
      for data packets process the packet */
   if ( (packet->seqno == relState->nextInOrderSeqNo) && (relState->serverState == WAITING_DATA_PACKET) )
   {
-    /* if we received an EOF packet close the connection */
+    /* if we received an EOF packet signal to conn_output and destroy the connection if appropriate */
     if (packet->len == EOF_PACKET_SIZE)
     {
       conn_output(relState->c, NULL, 0);
-      create_and_send_ack_packet (relState, packet->seqno + 1);
       relState->serverState = SERVER_FINISHED;
+      create_and_send_ack_packet (relState, packet->seqno + 1);
+
+      /* destroy the connection only if our client has finished transmitting */
+      if (relState->clientState == CLIENT_FINISHED)
+        rel_destroy(relState);      
     }
     /* we receive a non-EOF data packet, so try to flush it to conn_output */
     else
