@@ -72,12 +72,13 @@ void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
 void process_received_data_packet (rel_t *relState, packet_t *packet);
 void process_ack (rel_t *relState, packet_t *packet_t);
 void handle_retransmission(rel_t *relState);
-int getTimeSinceLastTransmission (rel_t *relState);
+int get_time_since_last_transmission (rel_t *relState);
 void process_data_packet (rel_t *relState, packet_t *packet);
 void create_and_send_ack_packet (rel_t *relState, uint32_t ackno);
 struct ack_packet *create_ack_packet (uint32_t ackno);
-void savePacketInfo(rel_t *relState, packet_t *packet);
-int flushPayloadToOutput(rel_t *relState);
+void save_incoming_data_packet (rel_t *relState, packet_t *packet);
+void save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength);
+int flush_payload_to_output (rel_t *relState);
 
 
 
@@ -138,7 +139,7 @@ rel_destroy (rel_t *r)
   conn_destroy (r->c);
 
   /* Free any other allocated memory here */
-  free(r);
+  free (r);
 }
 
 
@@ -180,26 +181,21 @@ rel_read (rel_t *relState)
     /* try to read from input and create a packet */
     packet_t *packet = create_packet_from_input (relState);
 
-    /* in case there was data in the input and a packet was created, proceed to process and 
-       send the packet */
+    /* in case there was data in the input and a packet was created, proceed to process, save
+       and send the packet */
     if (packet != NULL)
     {
       int packetLength = packet->len;
 
-      /* change client state according to whether we are sending EOF packet or normal packet
-         (if there is no payload then we are sending EOF packet) */
-      relState->clientState = (packetLength == PACKET_HEADER_SIZE) ? WAITING_EOF_ACK : WAITING_ACK;
+      /* change client state according to whether we are sending EOF packet or normal packet */
+      relState->clientState = (packetLength == EOF_PACKET_SIZE) ? WAITING_EOF_ACK : WAITING_ACK;
       
       prepare_for_transmission (packet);
       conn_sendpkt (relState->c, packet, (size_t) packetLength);
 
-      // TODO: factor out
       /* keep record of the last packet sent */
-      memcpy (&(relState->lastPacketSent), packet, packetLength); 
-      relState->lengthLastPacketSent = (size_t) packetLength;
-      relState->seqnoLastPacketSent += 1;
-      gettimeofday(&(relState->lastTransmissionTime), NULL); /* record the time of transmission */
-
+      save_outgoing_data_packet (relState, packet, packetLength);
+      
       free (packet);
     }
   }
@@ -211,9 +207,9 @@ rel_output (rel_t *relState)
   // TODO comment
   if (relState->serverState == WAITING_TO_FLUSH_DATA)
   {
-    if (flushPayloadToOutput(relState))
+    if (flush_payload_to_output (relState))
     {
-      create_and_send_ack_packet(relState, relState->lastReceivedPacketSeqno + 1);
+      create_and_send_ack_packet (relState, relState->lastReceivedPacketSeqno + 1);
       relState->nextInOrderSeqNo = relState->lastReceivedPacketSeqno + 1;
       relState->serverState = WAITING_DATA_PACKET;
     }
@@ -229,7 +225,7 @@ rel_timer ()
   /* go through every open reliable connection and retransmit packets as needed */ 
   while(r)
   {
-    handle_retransmission(r);
+    handle_retransmission (r);
     r = r->next;
   }
 }
@@ -265,7 +261,7 @@ create_packet_from_input (rel_t *relState)
 
   if (bytesRead == 0) /* there is no input, don't create a packet */
   {
-    free(packet);
+    free (packet);
     return NULL;
   }
   /* else there is some input, so create a packet */
@@ -333,7 +329,7 @@ compute_checksum (packet_t *packet, int packetLength)
   could really be a packet_t* or a struct ack_packet*.
 */
 int 
-is_packet_corrupted(packet_t *packet, size_t received_length)
+is_packet_corrupted (packet_t *packet, size_t received_length)
 {
   int packetLength = (int) ntohs (packet->len);
 
@@ -377,7 +373,7 @@ process_received_data_packet (rel_t *relState, packet_t *packet)
      should process part the ack part of the packet. */  
 
   /* Pass the packet to the server piece to process the data packet */
-  process_data_packet(relState, packet);
+  process_data_packet (relState, packet);
 
   /* Pass the packet to the client piece to process the ackno field */
   process_ack (relState, packet);
@@ -398,7 +394,7 @@ process_ack (rel_t *relState, packet_t *packet)
     if (packet->ackno == relState->seqnoLastPacketSent + 1)
     {
       relState->clientState = WAITING_INPUT_DATA;
-      rel_read(relState);
+      rel_read (relState);
     }
   }
   else if (relState->clientState == WAITING_EOF_ACK)
@@ -410,7 +406,7 @@ process_ack (rel_t *relState, packet_t *packet)
 
       /* destroy the connection only if the other side's client has finished transmitting */
       if (relState->serverState == SERVER_FINISHED)
-        rel_destroy(relState);
+        rel_destroy (relState);
     } 
   }
 }
@@ -431,22 +427,22 @@ process_data_packet (rel_t *relState, packet_t *packet)
     /* if we received an EOF packet signal to conn_output and destroy the connection if appropriate */
     if (packet->len == EOF_PACKET_SIZE)
     {
-      conn_output(relState->c, NULL, 0);
+      conn_output (relState->c, NULL, 0);
       relState->serverState = SERVER_FINISHED;
       create_and_send_ack_packet (relState, packet->seqno + 1);
 
       /* destroy the connection only if our client has finished transmitting */
       if (relState->clientState == CLIENT_FINISHED)
-        rel_destroy(relState);      
+        rel_destroy (relState);      
     }
     /* we receive a non-EOF data packet, so try to flush it to conn_output */
     else
     {
-      savePacketInfo(relState, packet);
+      save_incoming_data_packet (relState, packet);
       
-      if (flushPayloadToOutput(relState))
+      if (flush_payload_to_output (relState))
       {
-        create_and_send_ack_packet(relState, packet->seqno + 1);
+        create_and_send_ack_packet (relState, packet->seqno + 1);
         relState->nextInOrderSeqNo = packet->seqno + 1;
       }
       else
@@ -459,7 +455,7 @@ process_data_packet (rel_t *relState, packet_t *packet)
 
 // TODO: comment
 void
-savePacketInfo(rel_t *relState, packet_t *packet)
+save_incoming_data_packet (rel_t *relState, packet_t *packet)
 {  
   uint16_t payloadSize = packet->len - PACKET_HEADER_SIZE;
 
@@ -470,10 +466,20 @@ savePacketInfo(rel_t *relState, packet_t *packet)
 }
 
 // TODO: comment
-int
-flushPayloadToOutput(rel_t *relState)
+void 
+save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength)
 {
-  size_t bufferSpace = conn_bufspace(relState->c);
+  memcpy (&(relState->lastPacketSent), packet, packetLength); 
+  relState->lengthLastPacketSent = (size_t) packetLength;
+  relState->seqnoLastPacketSent += 1;
+  gettimeofday (&(relState->lastTransmissionTime), NULL); /* record the time of transmission */
+}
+
+// TODO: comment
+int
+flush_payload_to_output (rel_t *relState)
+{
+  size_t bufferSpace = conn_bufspace (relState->c);
   
   if (bufferSpace == 0)
     return 0;
@@ -483,7 +489,7 @@ flushPayloadToOutput(rel_t *relState)
   uint8_t *payload = relState->lastReceivedPacketPayload;
   uint16_t offset = relState->numFlushedBytes;
 
-  int bytesWritten = conn_output(relState->c, &payload[offset], writeLength);
+  int bytesWritten = conn_output (relState->c, &payload[offset], writeLength);
 
   relState->numFlushedBytes += bytesWritten;
 
@@ -498,13 +504,13 @@ handle_retransmission (rel_t *relState)
 {
   if (relState->clientState == WAITING_ACK || relState->clientState == WAITING_EOF_ACK)
   {
-    int millisecondsSinceTransmission = getTimeSinceLastTransmission (relState);
+    int millisecondsSinceTransmission = get_time_since_last_transmission (relState);
 
     /* last transmission timed out, retransmit last packet*/
     if (millisecondsSinceTransmission > relState->timeout) 
     {
       conn_sendpkt (relState->c, &(relState->lastPacketSent), relState->lengthLastPacketSent);
-      gettimeofday(&(relState->lastTransmissionTime), NULL); /* record retransmission time */
+      gettimeofday (&(relState->lastTransmissionTime), NULL); /* record retransmission time */
     }
   }
 }
@@ -514,10 +520,10 @@ handle_retransmission (rel_t *relState)
   was transmitted and now. 
 */
 int 
-getTimeSinceLastTransmission (rel_t *relState)
+get_time_since_last_transmission (rel_t *relState)
 {
   struct timeval now;
-  gettimeofday(&now, NULL);
+  gettimeofday (&now, NULL);
   
   return ( ( (int)now.tv_sec * 1000 + (int)now.tv_usec / 1000 ) - 
   ( (int)relState->lastTransmissionTime.tv_sec * 1000 + (int)relState->lastTransmissionTime.tv_usec / 1000 ) );
@@ -530,7 +536,7 @@ create_and_send_ack_packet (rel_t *relState, uint32_t ackno)
   int packetLength = ackPacket->len;
   prepare_for_transmission ((packet_t*)ackPacket);
   conn_sendpkt (relState->c, (packet_t*)ackPacket, (size_t) packetLength);
-  free(ackPacket);
+  free (ackPacket);
 }
 
 struct ack_packet *
@@ -539,7 +545,7 @@ create_ack_packet (uint32_t ackno)
   struct ack_packet *ackPacket;
   ackPacket = xmalloc (sizeof (*ackPacket));
 
-  ackPacket->len = (uint16_t)ACK_PACKET_SIZE;
+  ackPacket->len = (uint16_t) ACK_PACKET_SIZE;
   ackPacket->ackno = ackno;
   
   return ackPacket;
