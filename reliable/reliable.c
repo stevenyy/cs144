@@ -201,14 +201,19 @@ rel_read (rel_t *relState)
   }
 }
 
+/* 
+  This functionality belongs to the server piece and is called when there 
+  is space available to output a received data packet. 
+*/
 void
 rel_output (rel_t *relState)
 {
-  // TODO comment
+  /* continue if there was a packet that was waiting to be flushed to the output */
   if (relState->serverState == WAITING_TO_FLUSH_DATA)
   {
     if (flush_payload_to_output (relState))
     {
+      /* send ack back only after flushing ALL the packet */
       create_and_send_ack_packet (relState, relState->lastReceivedPacketSeqno + 1);
       relState->nextInOrderSeqNo = relState->lastReceivedPacketSeqno + 1;
       relState->serverState = WAITING_DATA_PACKET;
@@ -453,7 +458,11 @@ process_data_packet (rel_t *relState, packet_t *packet)
   }
 }
 
-// TODO: comment
+/* 
+  This functionality belongs to the server piece. This function saves a received 
+  data packet in case we can not flush it all at once and need to do it as output 
+  space becomes available. 
+*/
 void
 save_incoming_data_packet (rel_t *relState, packet_t *packet)
 {  
@@ -465,7 +474,12 @@ save_incoming_data_packet (rel_t *relState, packet_t *packet)
   relState->numFlushedBytes = 0;
 }
 
-// TODO: comment
+/* 
+  This funtionality belongs to the client piece. Save a copy of the last packet 
+  sent in case we need to retransmit. Note that the caller must provide a pointer
+  to a packet which has already been prepared for transmission, i.e. neccesary fields
+  are already in network byte order. 
+*/ 
 void 
 save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength)
 {
@@ -475,7 +489,12 @@ save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength)
   gettimeofday (&(relState->lastTransmissionTime), NULL); /* record the time of transmission */
 }
 
-// TODO: comment
+/*
+  This funcionality belongs to the server piece. The funtion tries to flush the
+  the parts of the last received data packet that were not previously flushed to 
+  the output. It returns 1 if ALL the data in the last packet has been flushed to 
+  the output and 0 otherwise.  
+*/
 int
 flush_payload_to_output (rel_t *relState)
 {
@@ -484,11 +503,12 @@ flush_payload_to_output (rel_t *relState)
   if (bufferSpace == 0)
     return 0;
 
-  size_t bytesLeft = relState->lastReceivedPayloadSize - relState->numFlushedBytes;
+  size_t bytesLeft = relState->lastReceivedPayloadSize - relState->numFlushedBytes; /* how many bytes we still have to flush */
   size_t writeLength = (bytesLeft < bufferSpace) ? bytesLeft : bufferSpace;
   uint8_t *payload = relState->lastReceivedPacketPayload;
   uint16_t offset = relState->numFlushedBytes;
 
+  /* try to write writeLength bytes of unflushed data to the output */
   int bytesWritten = conn_output (relState->c, &payload[offset], writeLength);
 
   relState->numFlushedBytes += bytesWritten;
@@ -499,9 +519,14 @@ flush_payload_to_output (rel_t *relState)
   return 0;
 }
 
+/* 
+  This function checks to see if there are any expired timeouts for unacknowledged packets
+  and retransmits accordingly. 
+*/
 void 
 handle_retransmission (rel_t *relState)
 {
+  /* Only retransmit if we are waiting for acks */
   if (relState->clientState == WAITING_ACK || relState->clientState == WAITING_EOF_ACK)
   {
     int millisecondsSinceTransmission = get_time_since_last_transmission (relState);
