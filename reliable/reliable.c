@@ -59,26 +59,33 @@ struct reliable_state {
 rel_t *rel_list;
 
 
+/* Function declarations */
 
-/* Helper function declarations */
+/* Helper functions for client piece */
 
 packet_t *create_packet_from_input (rel_t *relState);
-void prepare_for_transmission (packet_t *packet);
-void convert_packet_to_network_byte_order (packet_t *packet);
-uint16_t compute_checksum (packet_t *packet, int packetLength);
-int is_packet_corrupted(packet_t *packet, size_t received_length);
-void convert_packet_to_host_byte_order (packet_t *packet); 
 void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
-void process_received_data_packet (rel_t *relState, packet_t *packet);
-void process_ack (rel_t *relState, packet_t *packet_t);
 void handle_retransmission(rel_t *relState);
 int get_time_since_last_transmission (rel_t *relState);
+void save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength);
+
+/* Helper functions for server piece */
+
+void process_received_data_packet (rel_t *relState, packet_t *packet);
 void process_data_packet (rel_t *relState, packet_t *packet);
 void create_and_send_ack_packet (rel_t *relState, uint32_t ackno);
 struct ack_packet *create_ack_packet (uint32_t ackno);
 void save_incoming_data_packet (rel_t *relState, packet_t *packet);
-void save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength);
 int flush_payload_to_output (rel_t *relState);
+
+/* Helper functions shared by client and server pieces */
+
+void prepare_for_transmission (packet_t *packet);
+void convert_packet_to_network_byte_order (packet_t *packet);
+void convert_packet_to_host_byte_order (packet_t *packet); 
+uint16_t compute_checksum (packet_t *packet, int packetLength);
+int is_packet_corrupted(packet_t *packet, size_t received_length);
+void process_ack (rel_t *relState, packet_t *packet_t);
 
 
 
@@ -386,7 +393,9 @@ process_received_data_packet (rel_t *relState, packet_t *packet)
 
 /*
   This function processes received ack only packets which have passed the corruption check. 
-  This functionality belongs to the client piece.  
+  This functionality belongs to the client and server piece.  
+  NOTE: this function works for data packets as well as ack only packets, i.e. packet
+  could really be a packet_t* or a struct ack_packet*.
 */
 void 
 process_ack (rel_t *relState, packet_t *packet)
