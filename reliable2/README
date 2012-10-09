@@ -1,0 +1,106 @@
+Student: Diego Rafael Moreno Ferrer
+SUID: rmferrer
+email: rmferrer@cs.stanford.edu
+
+CS144 
+README for Lab 1
+
+Recall that the functionality in the assignment can be divided into two separate entities with
+two separate state machines. 1) The CLIENT is responsible for reading data from conn_input,
+putting it into packets, sending/retransmitting it via conn_sendpkt and receiving/processing 
+the acks sent by the other side. 2) The SERVER is concerned with receiving data, flushing it 
+to conn_output and sending acks to the other side. So CLIENT sends data and receives acks and 
+SERVER receives data and sends acks. 
+
+Most of the logic/functions can be divided along the lines of client functionality and server
+functionality. There are also other utility functions shared by both the client and the server
+such as prepare_for_transmission (which takes any type of outgoing packet and puts it in
+network byte order and computes its checksum), is_packet_corrupted,
+convert_packet_to_host_byte_order, convert_packet_to_network_byte_order, compute_checksum, etc. This functions are explained in the internal documentation in reliable.c.
+
+
+Discussion of Client Side:
+
+The following state is kept in the rel_t structure of the connection for the client:
+
+
+  enum client_state clientState;
+  packet_t lastPacketSent; 
+  size_t lengthLastPacketSent; 
+  uint32_t seqnoLastPacketSent;
+  struct timeval lastTransmissionTime;
+
+The clientState keeps track of the state the client is in. We have 4 states:
+WAITING_INPUT_DATA (the client is waiting for data from input), WAITING_ACK (the client has
+sent some non-EOF data and is waiting for an ack), WAITING_EOF_ACK (the client has send an EOF
+packet and is waiting for the ACK of that packet), CLIENT_FINISHED (the client has received
+the ACK for the EOF packet it sent and has declares the connection closed). The design of the
+client is simple: the client will start in WAITING_INPUT_DATA state. The client will only ask conn_input for data only when it is in
+WAITING_INPUT_DATA state. If it is in that state it will only ask for one packet's worth of
+data and no more. The idea is that the client will not burden itself with more data that it
+can handle and will not buffer extra data that conn_input, it will let conn_input buffer the
+extra data it has. Once it has received some data from conn_input it will transition to
+WAITING_ACK or WAITING_EOF_ACK state depending on what type of data it got from the input. In
+any of these two states it will not respond to any rel_read events (i.e. it will not pay
+attention to any input available) and will only concern itseld with getting the ACK its
+expecting and retransmitting the last packet sent if necessary (in rel_timer). Thus the last
+packet sent and its transmission time are kept as part of the rel_t state of the client. The
+client will retransmit indefinitely many times until it gets the ACK it is expecting. Once it
+gets the ACK it is expecting it will either transition back to WAITING_INPUT_DATA or
+CLIENT_FINISHED state depending on whether it got an ACK for a non-EOF or EOF packet sent. At
+CLIENT_FINISHED the client will not transition out of that state any more and will not take
+any actions to any events. If it goes back to WAITING_INPUT it will after receiving an ACK for
+a non-EOF packet it will call rel_read to see if there is any data available from the input.
+At this point the client will be waiting for the next input available and will be ready to
+send the next packet. 
+
+Discussion of Server Side:
+
+The following state is kept in the rel_t structure of the connection for the server:
+  
+  enum server_state serverState;
+  uint32_t nextInOrderSeqNo; 
+  uint8_t lastReceivedPacketPayload[PAYLOAD_MAX_SIZE];
+  uint32_t lastReceivedPacketSeqno;
+  uint16_t lastReceivedPayloadSize;
+  uint16_t numFlushedBytes;
+
+The serverState field keeps track of the state the server is in. There are 3 states:
+WAITING_DATA_PACKET (the server is waiting for a data packet from the other side),
+WAITING_TO_FLUSH_DATA (the server has received some data from the other side and it is waiting
+to flush entirely it to conn_output), and SERVER_FINISHED (the server has received an EOF
+packet from the other end and has declared the connection closed). The design for the server
+code follows the following idea: the server will start in WAITING_DATA_PACKET state. The
+server will acknowledge already seen packets regardless of which state it is in. The server
+will only process incoming data packets if it is in WAITING_DATA_PACKET state. Once it is and
+it receives the data packet with the next sequence number it expects it will process the packe
+. If the packet is an EOF packet it will transition to SERVER_FINISHED state and will then on
+respond to receiving already seen packets and acknowledging them. If it receives a non-EOF
+packet it will save a copy of the packet in its rel_t structure and will proceed to try to
+flush the packet's data to conn_ouput. If it is successful flushing all data to conn_output it
+will send an ack back and will stay in WAITING_DATA_PACKET state to receive the next data
+packet. If it is not successfull flushing all data in the packet it will enter the
+WAITING_TO_FLUSH_DATA state and will wait for available space on conn_output. Once conn_output
+releases space and calls rel_output the server will try to flush the remaining data in the
+last packet received. Upon success it will return to WAITING_DATA_PACKET state and upon
+failure it will stay in the same state. The server will only return to WAITING_DATA_PACKET
+state once all data it has saved from the last packet has been flushed. 
+
+
+Some other considerations in the code: The rel_recvpkt and rel_destroy functions are functions
+both used by the client and server sides (rel_read and rel_timer is client only, and
+rel_output is server only). 
+
+The rel_recvpkt function will take packets for both the client and the server and will check
+the packet for corruption, dropping it if it is corrupted, will convert it to host byte order,
+and depending on whether it was an ack_only packet or a data packet it will then invoke code
+belonging to the client or server to deal with the packet. The function process_data_packet
+handles data packets for the server side and checks if the packet has already been seen in
+which case it sends an ack or it it has not been seen and it the next in sequence it
+processes it and sends an ack if flushed. The function process_ack takes either an ack_only
+packet or a data packet and process the ack number in it. 
+
+The rel_destroy function is called either by the client or the server. It is called by the
+client if it receives an an ack for the last EOF packet it sent and the server side is
+already in SERVER_FINISHED state. It is called by the server in case it receives an in
+sequence data packet that has no payload (i.e. and EOF packet) and if the client side is already in CLIENT_FINISHED (after calling conn_output with a zero length of course).
