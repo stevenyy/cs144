@@ -17,7 +17,11 @@
 *~
 *._*
 
-$ Lab 1 specific files
+# Lab 1 specific files
 reliable/reliable
 reliable/uc
 reliable/reliable.tar.gz
+
+# Lab 2 specific files
+reliable2/reliable
+reliable2/uc
