@@ -67,7 +67,11 @@ struct client_state {
 
   /* Extra state for convenience */
   int isEOFinFlight;
+  uint32_t EOFseqno;
   int isPartialInFlight;
+
+  // for debugging
+  int numPartialsInFlight; // TODO: delete for submission
 };
 typedef struct client_state client_state_t; 
 
@@ -107,7 +111,7 @@ rel_t *rel_list;
 
 packet_t *create_packet_from_input (rel_t *relState);
 void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
-void handle_retransmission(rel_t *relState);
+void handle_retransmission (rel_t *relState);
 int get_time_since_last_transmission (rel_t *relState);
 void save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength, uint32_t seqno);
 
@@ -126,15 +130,15 @@ void prepare_for_transmission (packet_t *packet);
 void convert_packet_to_network_byte_order (packet_t *packet);
 void convert_packet_to_host_byte_order (packet_t *packet); 
 uint16_t compute_checksum (packet_t *packet, int packetLength);
-int is_packet_corrupted(packet_t *packet, size_t receivedLength);
+int is_packet_corrupted (packet_t *packet, size_t receivedLength);
 void process_ack (rel_t *relState, packet_t *packet_t);
 
 
 
 /* TODO: remove next comment. */
 /* new helper functions for lab2 */
-void send_full_or_partial_packet (rel_t *relState);
-void send_full_packet_only (rel_t *relState);
+void send_full_or_partial_packet (rel_t *relState, packet_t *packet);
+void send_full_packet_only (rel_t *relState, packet_t *packet);
 int is_partial_packet_in_flight (rel_t *relState);
 int is_client_finished (rel_t *relState);
 int is_EOF_in_flight (rel_t *relState);
@@ -191,7 +195,10 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   r->clientState.tailPacketsInFlightList = NULL;
   r->clientState.isFinished = FALSE;
   r->clientState.isEOFinFlight = FALSE;
+  r->clientState.EOFseqno = 0; // TODO: this is semantically incorrect but it should be OK
   r->clientState.isPartialInFlight = FALSE;
+
+  r->clientState.numPartialsInFlight = 0; // TODO: delete for submission
   
   /* Server initialization */
   r->serverState = WAITING_DATA_PACKET;
@@ -252,23 +259,44 @@ void
 rel_read (rel_t *relState)
 {
   /* do not read anything from input if: 1) the client is finished transmitting data, OR 
-     2) an EOF packet is in flight, OR 3) the window is full. */ 
-  if (is_client_finished (relState) || is_EOF_in_flight (relState) || is_window_full (relState))
+     2) an EOF packet is in flight. */ 
+  if (is_client_finished (relState) || is_EOF_in_flight (relState))
     return;
 
-  /* Case 1: the window is not full and all packets in flight carry full payload. 
-     In this case we can send either a packet with full or partial payload if there 
-     is any input data available. */
-  if (!is_partial_packet_in_flight (relState))
-    send_full_or_partial_packet (relState);
-  
-  /* Case 2: the window is not full but there is a partially filled packet in flight 
-     In this case we can only send a packet if it has a full payload. If not enough 
-     data is available from the input we will buffer the partial payload until either
-     the partial packet in flight is acked or we get enough data from the input to form 
-     a full packet. */
-  else
-    send_full_packet_only (relState);
+  /* the window is not full, so there is room to send packets */
+  whille (!is_window_full (relState))
+  {
+    /* try to read from input and create a packet */
+    packet_t *packet = create_packet_from_input (relState);
+
+    /* if packet is NULL then there was no more data available from the input and no packet 
+       was allocated. In this case stop sending packets and return. */ 
+    if (packet == NULL)
+      return;
+
+    // TODO: delete when implementing Nagle
+    send_full_or_partial_packet (relState, packet);
+    
+    /* Otherwise a packet was created, so proceed to process it and try to send. */
+
+    /* Case 1: all packets in flight carry full payload. 
+       In this case we can send either a packet with full or partial payload if there 
+       is any input data available. */
+       // TODO: uncomment when Nagle is implemented
+    // if (!is_partial_packet_in_flight (relState))
+    //   send_full_or_partial_packet (relState, packet);
+    
+    /* Case 2: there is a partially filled packet in flight.
+       In this case we can only send a packet if it has a full payload. If not enough 
+       data is available from the input we will buffer the partial payload until either
+       the partial packet in flight is acked or we get enough data from the input to form 
+       a full packet. */
+       // TODO: uncomment when Nagle is implemented. 
+    // else
+    //   send_full_packet_only (relState, packet);
+
+    free (packet);    
+  }
 }
 
 /* 
@@ -298,7 +326,7 @@ rel_timer ()
   rel_t *r = rel_list;
 
   /* go through every open reliable connection and retransmit packets as needed */ 
-  while(r)
+  while (r)
   {
     handle_retransmission (r);
     r = r->next;
@@ -608,28 +636,41 @@ create_ack_packet (uint32_t ackno)
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// TODO comment
 void
-send_full_or_partial_packet (rel_t *relState)
+send_full_or_partial_packet (rel_t *relState, packet_t *packet)
 {
-  /* try to read from input and create a packet */
-  packet_t *packet = create_packet_from_input (relState);
+  int packetLength = packet->len;
+  uint32_t seqno = packet->seqno;
 
-  /* in case there was data in the input and a packet was created, proceed to process, send
-     and save the packet */
-  if (packet != NULL)
-  {
-    int packetLength = packet->len;
-    uint32_t seqno = packet->seqno;
+  /* convert packet to network byte order, compute checksum, and send it */
+  prepare_for_transmission (packet);
+  conn_sendpkt (relState->c, packet, (size_t) packetLength);
 
-    /* convert packet to network byte order, compute checksum, and send it */
-    prepare_for_transmission (packet);
-    conn_sendpkt (relState->c, packet, (size_t) packetLength);
+  /* save last packet sent to the window of in flight packets */
+  save_outgoing_data_packet (relState, packet, packetLength, seqno);
+}
 
-    /* save last packet sent to the window of in flight packets */
-    save_outgoing_data_packet (relState, packet, packetLength, seqno);
-
-    free (packet);
-  }
+// TODO comment
+void 
+send_full_packet_only (rel_t *relState, packet_t *packet)
+{
+  // TODO: implement
 }
 
 /* 
@@ -668,7 +709,7 @@ create_packet_from_input (rel_t *relState)
   packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
                                     (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
   packet->ackno = (uint32_t) 0; /* not piggybacking acks, don't ack any packets */
-  packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1);
+  packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1); // BUG_RISK +- 1 error
 
   return packet;
 }
@@ -688,16 +729,11 @@ save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength, 
   save_to_in_flight_list (relState, packetRecord);
 }
 
-
-void 
-send_full_packet_only (rel_t *relState)
-{
-  // TODO: implement
-}
-
 int 
 is_partial_packet_in_flight (rel_t *relState)
 {
+  // TODO: delete for submission
+  abort_if(relState->clientState.numPartialsInFlight > 1 || relState->clientState.numPartialsInFlight < 0, "in is_partial_packet_in_flight: more than 1 packet in flight.")
   return relState->clientState.isPartialInFlight;
 }
 
@@ -739,7 +775,7 @@ packet_record_t *
 create_packet_record (packet_t *packet, int packetLength, uint32_t seqno)
 {
   packet_record_t *packetRecord;
-  packetRecord = xmalloc (sizeof(*packetRecord));
+  packetRecord = xmalloc (sizeof (*packetRecord));
 
   memcpy (&(packetRecord->packet), packet, packetLength); 
   packetRecord->packetLength = (size_t) packetLength;
@@ -778,11 +814,16 @@ update_client_state (rel_t *relState, packet_record_t *packetRecord)
   relState->clientState.lastSentSeqno = packetRecord->seqno;
   relState->clientState.numPacketsInFlight += 1;
   if (packetLength == EOF_PACKET_SIZE)
+  {
     relState->clientState.isEOFinFlight = TRUE;
+    relState->clientState.EOFseqno = packetRecord->seqno;
+  }
   else if (packetLength > EOF_PACKET_SIZE && packetLength < PACKET_MAX_SIZE)
   {
     relState->clientState.isEOFinFlight = FALSE;
     relState->clientState.isPartialInFlight = TRUE;
+
+    relState->clientState.numPartialsInFlight += 1; // TODO: delete for submission
   }
 
   // TODO delete for submission
