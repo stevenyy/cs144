@@ -264,7 +264,7 @@ rel_read (rel_t *relState)
     return;
 
   /* the window is not full, so there is room to send packets */
-  whille (!is_window_full (relState))
+  while (!is_window_full (relState))
   {
     /* try to read from input and create a packet */
     packet_t *packet = create_packet_from_input (relState);
