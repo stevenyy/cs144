@@ -22,14 +22,60 @@
 #define ACK_PACKET_SIZE 8
 #define MILLISECONDS_IN_SECOND 1000
 #define MICROSECONDS_IN_MILLISECOND 1000
+#define TRUE 1
+#define FALSE 0
 
-enum client_state{
-  WAITING_INPUT_DATA, WAITING_ACK, WAITING_EOF_ACK, CLIENT_FINISHED
+/* Wrapper struct around packet_t with extra information useful for retransmission. */
+struct packet_record {
+  /* This pointer must be the first field in order for linked list generic function to work */
+  struct packet_record *next; 
+
+  size_t packetLength;
+  uint32_t seqno;
+  struct timeval lastTransmissionTime;
+  
+  /* This is a copy of the packet as passed to conn_sendpkt (i.e. in network byte order and with checksum) */
+  packet_t packet;
 };
+typedef struct packet_record packet_record_t;
+
+/* 
+  This is a structure for a generic node in a singly linked list. 
+  It is used by functions which manipulate generic linked lists for 
+  casting (see for example append_to_list). 
+  NOTE: for these generic list manipulation functions to work, nodes 
+  in the lists must have a 'next' pointer as their first field. */
+struct node
+{
+  struct node *next;
+};
+typedef struct node node_t;
+
+
+struct client_state {
+  int windowSize; /* SWS */
+  uint32_t lastAckedSeqno; /* LAR */
+  uint32_t lastSentSeqno; /* LSS */
+  /* client must maintain invariant LSS - LAR <= SWS */
+
+  int numPacketsInFlight;
+  /* head and tail pointers to linked list of packets in flight */ 
+  packet_record_t *headPacketsInFlightList;
+  packet_record_t *tailPacketsInFlightList; 
+  
+  int isFinished; /* has client finished sending data? (i.e. sent and received an ack for EOF packet)*/
+
+  /* Extra state for convenience */
+  int isEOFinFlight;
+  int isPartialInFlight;
+};
+typedef struct client_state client_state_t; 
 
 enum server_state{
   WAITING_DATA_PACKET, WAITING_TO_FLUSH_DATA, SERVER_FINISHED
 };
+
+
 
 struct reliable_state {
   rel_t *next;			/* Linked list for traversing all connections */
@@ -41,12 +87,8 @@ struct reliable_state {
   int timeout;
 
   /* State for the client */
-  enum client_state clientState;
-  packet_t lastPacketSent; /* keeps a copy of last packet sent as passed to conn_sendpkt */
-  size_t lengthLastPacketSent; 
-  uint32_t seqnoLastPacketSent;
-  struct timeval lastTransmissionTime;
-
+  client_state_t clientState;
+  
   /* State for the server */
   enum server_state serverState;
   uint32_t nextInOrderSeqNo; /* The sequence number of the next in-order packet we expect to receive. */
@@ -67,7 +109,7 @@ packet_t *create_packet_from_input (rel_t *relState);
 void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
 void handle_retransmission(rel_t *relState);
 int get_time_since_last_transmission (rel_t *relState);
-void save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength);
+void save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength, uint32_t seqno);
 
 /* Helper functions for server piece */
 
@@ -84,9 +126,26 @@ void prepare_for_transmission (packet_t *packet);
 void convert_packet_to_network_byte_order (packet_t *packet);
 void convert_packet_to_host_byte_order (packet_t *packet); 
 uint16_t compute_checksum (packet_t *packet, int packetLength);
-int is_packet_corrupted(packet_t *packet, size_t received_length);
+int is_packet_corrupted(packet_t *packet, size_t receivedLength);
 void process_ack (rel_t *relState, packet_t *packet_t);
 
+
+
+/* TODO: remove next comment. */
+/* new helper functions for lab2 */
+void send_full_or_partial_packet (rel_t *relState);
+void send_full_packet_only (rel_t *relState);
+int is_partial_packet_in_flight (rel_t *relState);
+int is_client_finished (rel_t *relState);
+int is_EOF_in_flight (rel_t *relState);
+int is_window_full (rel_t *relState);
+packet_record_t *create_packet_record (packet_t *packet, int packetLength, uint32_t seqno);
+void save_to_in_flight_list (rel_t *relState, packet_record_t *packetRecord);
+void append_to_list (node_t **head, node_t **tail, node_t *newNode);
+void update_client_state (rel_t *relState, packet_record_t *packetRecord);
+
+// TODO delete function for submission
+void abort_if (int expression, char *msg);
 
 
 
@@ -124,9 +183,16 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   r->timeout = cc->timeout;
 
   /* Client initialization */
-  r->clientState = WAITING_INPUT_DATA;
-  r->seqnoLastPacketSent = 0;
-
+  r->clientState.windowSize = cc->window;
+  r->clientState.lastAckedSeqno = 0; // TODO/BUG_RISK: check this initializations
+  r->clientState.lastSentSeqno = 0;
+  r->clientState.numPacketsInFlight = 0;
+  r->clientState.headPacketsInFlightList = NULL;
+  r->clientState.tailPacketsInFlightList = NULL;
+  r->clientState.isFinished = FALSE;
+  r->clientState.isEOFinFlight = FALSE;
+  r->clientState.isPartialInFlight = FALSE;
+  
   /* Server initialization */
   r->serverState = WAITING_DATA_PACKET;
   r->nextInOrderSeqNo = 1;
@@ -147,6 +213,8 @@ rel_destroy (rel_t *r)
 
   /* Free any other allocated memory here */
   free (r);
+  // TODO: free memory allocated to packets in flight from client window 
+  // TODO: free memory allocated to buffered packets in server window 
 }
 
 
@@ -166,9 +234,9 @@ rel_demux (const struct config_common *cc,
 }
 
 void
-rel_recvpkt (rel_t *relState, packet_t *packet, size_t received_length)
+rel_recvpkt (rel_t *relState, packet_t *packet, size_t receivedLength)
 {
-  if (is_packet_corrupted (packet, received_length)) /* do not do anything if packet is corrupted */
+  if (is_packet_corrupted (packet, receivedLength)) /* do not do anything if packet is corrupted */
     return;
 
   convert_packet_to_host_byte_order (packet); 
@@ -183,29 +251,24 @@ rel_recvpkt (rel_t *relState, packet_t *packet, size_t received_length)
 void
 rel_read (rel_t *relState)
 {
-  if (relState->clientState == WAITING_INPUT_DATA)
-  {
-    /* try to read from input and create a packet */
-    packet_t *packet = create_packet_from_input (relState);
+  /* do not read anything from input if: 1) the client is finished transmitting data, OR 
+     2) an EOF packet is in flight, OR 3) the window is full. */ 
+  if (is_client_finished (relState) || is_EOF_in_flight (relState) || is_window_full (relState))
+    return;
 
-    /* in case there was data in the input and a packet was created, proceed to process, save
-       and send the packet */
-    if (packet != NULL)
-    {
-      int packetLength = packet->len;
-
-      /* change client state according to whether we are sending EOF packet or normal packet */
-      relState->clientState = (packetLength == EOF_PACKET_SIZE) ? WAITING_EOF_ACK : WAITING_ACK;
-      
-      prepare_for_transmission (packet);
-      conn_sendpkt (relState->c, packet, (size_t) packetLength);
-
-      /* keep record of the last packet sent */
-      save_outgoing_data_packet (relState, packet, packetLength);
-      
-      free (packet);
-    }
-  }
+  /* Case 1: the window is not full and all packets in flight carry full payload. 
+     In this case we can send either a packet with full or partial payload if there 
+     is any input data available. */
+  if (!is_partial_packet_in_flight (relState))
+    send_full_or_partial_packet (relState);
+  
+  /* Case 2: the window is not full but there is a partially filled packet in flight 
+     In this case we can only send a packet if it has a full payload. If not enough 
+     data is available from the input we will buffer the partial payload until either
+     the partial packet in flight is acked or we get enough data from the input to form 
+     a full packet. */
+  else
+    send_full_packet_only (relState);
 }
 
 /* 
@@ -247,46 +310,6 @@ rel_timer ()
 
 
 /********* HELPER FUNCTION SECTION *********/
-
-/* 
-  This function is called to read from conn_input, create a packet from that 
-  data if any data is available from conn_input, and return it. 
-
-  Notes:
-  - The function will try to read data from conn_input, if there is no input
-    available (conn_input returns 0) the function will not create a packet and will 
-    return NULL.
-  - In case a packet is created, this function allocates memory for the packet
-    which the caller should free.
-  - This function does not compute/write the cksum field of the packet. This 
-    should be done when the packet is to be transmitted over UDP only after 
-    converting all necessary fields to network byte order. 
-*/
-packet_t *
-create_packet_from_input (rel_t *relState)
-{
-  packet_t *packet;
-  packet = xmalloc (sizeof (*packet));
-
-  /* try to read one full packet's worth of data from input */
-  int bytesRead = conn_input (relState->c, packet->data, PAYLOAD_MAX_SIZE);
-
-  if (bytesRead == 0) /* there is no input, don't create a packet */
-  {
-    free (packet);
-    return NULL;
-  }
-  /* else there is some input, so create a packet */
-
-  /* if we read an EOF create a zero byte payload, otherwise we read normal bytes
-     that should be declared in the len field */
-  packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
-                                    (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
-  packet->ackno = (uint32_t) 1; /* not piggybacking acks, don't ack any packets */
-  packet->seqno = (uint32_t) (relState->seqnoLastPacketSent + 1);
-
-  return packet;
-}
 
 /*
   This function takes a packet and gets it ready for transmission over UDP. 
@@ -341,12 +364,12 @@ compute_checksum (packet_t *packet, int packetLength)
   could really be a packet_t* or a struct ack_packet*.
 */
 int 
-is_packet_corrupted (packet_t *packet, size_t received_length)
+is_packet_corrupted (packet_t *packet, size_t receivedLength)
 {
   int packetLength = (int) ntohs (packet->len);
 
   /* If we received fewer bytes than the packet's size declare corruption. */
-  if (received_length < (size_t)packetLength) 
+  if (receivedLength < (size_t)packetLength) 
     return 1;
 
   uint16_t packetChecksum = packet->cksum;
@@ -393,9 +416,9 @@ process_received_data_packet (rel_t *relState, packet_t *packet)
 
 /*
   This function processes received ack only packets which have passed the corruption check. 
-  This functionality belongs to the client and server piece.  
   NOTE: this function works for data packets as well as ack only packets, i.e. packet
   could really be a packet_t* or a struct ack_packet*.
+  NOTE: This functionality belongs to the client piece.  
 */
 void 
 process_ack (rel_t *relState, packet_t *packet)
@@ -425,7 +448,10 @@ process_ack (rel_t *relState, packet_t *packet)
   }
 }
 
-/* This function processes a data packet. This is functionality of the server piece. */ 
+/* 
+  This function processes a data packet.
+  NOTE: This functionality belongs to the server piece. 
+*/ 
 void
 process_data_packet (rel_t *relState, packet_t *packet)
 {
@@ -468,9 +494,9 @@ process_data_packet (rel_t *relState, packet_t *packet)
 }
 
 /* 
-  This functionality belongs to the server piece. This function saves a received 
-  data packet in case we can not flush it all at once and need to do it as output 
-  space becomes available. 
+  This function saves a received data packet in case we can not flush it all
+  at once and need to do it as output space becomes available. 
+  NOTE: This functionality belongs to the server piece. 
 */
 void
 save_incoming_data_packet (rel_t *relState, packet_t *packet)
@@ -483,26 +509,11 @@ save_incoming_data_packet (rel_t *relState, packet_t *packet)
   relState->numFlushedBytes = 0;
 }
 
-/* 
-  This funtionality belongs to the client piece. Save a copy of the last packet 
-  sent in case we need to retransmit. Note that the caller must provide a pointer
-  to a packet which has already been prepared for transmission, i.e. neccesary fields
-  are already in network byte order. 
-*/ 
-void 
-save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength)
-{
-  memcpy (&(relState->lastPacketSent), packet, packetLength); 
-  relState->lengthLastPacketSent = (size_t) packetLength;
-  relState->seqnoLastPacketSent += 1;
-  gettimeofday (&(relState->lastTransmissionTime), NULL); /* record the time of transmission */
-}
-
 /*
-  This funcionality belongs to the server piece. The funtion tries to flush the
-  the parts of the last received data packet that were not previously flushed to 
-  the output. It returns 1 if ALL the data in the last packet has been flushed to 
-  the output and 0 otherwise.  
+  The funtion tries to flush the parts of the last received data packet that were
+  not previously flushed to the output. It returns 1 if ALL the data in the last
+  packet has been flushed to the output and 0 otherwise. 
+  NOTE: This funcionality belongs to the server piece.
 */
 int
 flush_payload_to_output (rel_t *relState)
@@ -583,4 +594,234 @@ create_ack_packet (uint32_t ackno)
   ackPacket->ackno = ackno;
   
   return ackPacket;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+void
+send_full_or_partial_packet (rel_t *relState)
+{
+  /* try to read from input and create a packet */
+  packet_t *packet = create_packet_from_input (relState);
+
+  /* in case there was data in the input and a packet was created, proceed to process, send
+     and save the packet */
+  if (packet != NULL)
+  {
+    int packetLength = packet->len;
+    uint32_t seqno = packet->seqno;
+
+    /* convert packet to network byte order, compute checksum, and send it */
+    prepare_for_transmission (packet);
+    conn_sendpkt (relState->c, packet, (size_t) packetLength);
+
+    /* save last packet sent to the window of in flight packets */
+    save_outgoing_data_packet (relState, packet, packetLength, seqno);
+
+    free (packet);
+  }
+}
+
+/* 
+  This function is called to read from conn_input, create a packet from that 
+  data if any data is available from conn_input, and return it. 
+
+  Notes:
+  - The function will try to read data from conn_input, if there is no input
+    available (conn_input returns 0) the function will not create a packet and will 
+    return NULL.
+  - In case a packet is created, this function allocates memory for the packet
+    which the caller should free.
+  - This function does not compute/write the cksum field of the packet. This 
+    should be done when the packet is to be transmitted over UDP only after 
+    converting all necessary fields to network byte order. 
+*/
+packet_t *
+create_packet_from_input (rel_t *relState)
+{
+  // BUG_RISK 
+  packet_t *packet;
+  packet = xmalloc (sizeof (*packet));
+
+  /* try to read one full packet's worth of data from input */
+  int bytesRead = conn_input (relState->c, packet->data, PAYLOAD_MAX_SIZE);
+
+  if (bytesRead == 0) /* there is no input, don't create a packet */
+  {
+    free (packet);
+    return NULL;
+  }
+  /* else there is some input, so create a packet */
+
+  /* if we read an EOF create a zero byte payload, otherwise we read normal bytes
+     that should be declared in the len field */
+  packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
+                                    (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
+  packet->ackno = (uint32_t) 0; /* not piggybacking acks, don't ack any packets */
+  packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1);
+
+  return packet;
+}
+
+
+/* 
+  Save a copy of the last packet sent to the list of in-flight packets in case 
+  we need to retransmit. Note that the caller must provide a pointer to a packet
+  which has already been prepared for transmission, i.e. neccesary fields
+  are already in network byte order, as well as its length and sequence number.
+  NOTE: This funtionality belongs to the client piece.
+*/ 
+void 
+save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength, uint32_t seqno)
+{
+  packet_record_t *packetRecord = create_packet_record (packet, packetLength, seqno);
+  save_to_in_flight_list (relState, packetRecord);
+}
+
+
+void 
+send_full_packet_only (rel_t *relState)
+{
+  // TODO: implement
+}
+
+int 
+is_partial_packet_in_flight (rel_t *relState)
+{
+  return relState->clientState.isPartialInFlight;
+}
+
+int 
+is_client_finished (rel_t *relState)
+{
+  return relState->clientState.isFinished;
+} 
+
+int 
+is_EOF_in_flight (rel_t *relState)
+{
+  return relState->clientState.isEOFinFlight;
+}
+
+int 
+is_window_full (rel_t *relState)
+{
+  int numPacketsInFlight = relState->clientState.numPacketsInFlight;
+  int windowSize = relState->clientState.windowSize;
+  
+  // TODO clean up after testing & before submission
+  if (numPacketsInFlight < windowSize && numPacketsInFlight >= 0)
+    return 0;
+  else if (numPacketsInFlight == windowSize)
+    return 1;
+  else abort_if (TRUE, "in is_window_full: numPacketsInFlight < 0 or > windowSize");
+}
+
+/* 
+  This function is used to create a record of a packet that was sent with 
+  conn_sendpkt and is in flight. This function creates a packet_record_t 
+  struct with a copy of the packet in network byte order. 
+  NOTE: this functionality belongs to the client piece. 
+  NOTE: this function allocates memory for the packet_record_t, this memory should
+  be freed when the packet is acked and taken off packet-in-flight list.
+*/
+packet_record_t *
+create_packet_record (packet_t *packet, int packetLength, uint32_t seqno)
+{
+  packet_record_t *packetRecord;
+  packetRecord = xmalloc (sizeof(*packetRecord));
+
+  memcpy (&(packetRecord->packet), packet, packetLength); 
+  packetRecord->packetLength = (size_t) packetLength;
+  packetRecord->seqno = seqno;
+  gettimeofday (&(packetRecord->lastTransmissionTime), NULL); /* record the time of transmission */
+
+  return packetRecord;
+}
+
+/*
+  This function takes in a packet_record for a packet that has just been
+  sent, updates the clientState accordingly and appends it to the linked
+  list of packets in flight.  
+*/
+void 
+save_to_in_flight_list (rel_t *relState, packet_record_t *packetRecord)
+{  
+  update_client_state (relState, packetRecord);
+  append_to_list ((node_t **) &(relState->clientState.headPacketsInFlightList), 
+                  (node_t **) &(relState->clientState.tailPacketsInFlightList),
+                  (node_t *) packetRecord);
+}
+
+/*
+  This function takes a packet_record_t to be stored in the linked list of packets
+  in flight and updates the clientState fields accordingly, except for linked list pointers.
+  NOTE: this function belongs to the client piece. 
+  // TODO: update_client_state is also a name for the function that updates client
+  state if a node is deleted. change name or incorporate functionality. 
+*/
+void 
+update_client_state (rel_t *relState, packet_record_t *packetRecord)
+{
+  int packetLength = packetRecord->packetLength;
+
+  relState->clientState.lastSentSeqno = packetRecord->seqno;
+  relState->clientState.numPacketsInFlight += 1;
+  if (packetLength == EOF_PACKET_SIZE)
+    relState->clientState.isEOFinFlight = TRUE;
+  else if (packetLength > EOF_PACKET_SIZE && packetLength < PACKET_MAX_SIZE)
+  {
+    relState->clientState.isEOFinFlight = FALSE;
+    relState->clientState.isPartialInFlight = TRUE;
+  }
+
+  // TODO delete for submission
+  abort_if(packetLength < EOF_PACKET_SIZE || packetLength > PACKET_MAX_SIZE, "In update_client_state, packet with wrong length");
+}
+
+/*
+  This function appends a node to a singly linked list. Note that this is a generic
+  function since all pointers are casted to node_t * and node_t **. This means 
+  that in order to use this function the nodes in the linked list must have 
+  a next pointer as the first field (see comment on top of struct node declaration). 
+*/
+void 
+append_to_list (node_t **head, node_t **tail, node_t *newNode)
+{
+  newNode->next = NULL;
+
+  /* case where list is empty */
+  if (*head == NULL && *tail == NULL)
+  {
+    *head = newNode;
+    *tail = newNode;
+  }
+  /* case where list is non-empty */
+  else
+  {  
+    // BUG_RISK
+    (*tail)->next = newNode; /* point 'next' pointer of last node in the list to newNode */
+    *tail = newNode /* point tail to newNode */
+  }
+}
+
+// TODO: delete for submission
+void 
+abort_if (int expression, char *msg)
+{
+  if (expression)
+  {
+    fprintf (stderr, msg);
+    abort ();
+  }  
 }
