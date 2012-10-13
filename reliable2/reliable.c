@@ -267,14 +267,14 @@ rel_recvpkt (rel_t *relState, packet_t *packet, size_t receivedLength)
 void
 rel_read (rel_t *relState)
 {
-  /* do not read anything from input if: 1) the client is finished transmitting data, OR 
-     2) an EOF packet is in flight. */ 
-  if (is_client_finished (relState) || is_EOF_in_flight (relState))
-    return;
-
-  /* the window is not full, so there is room to send packets */
+  /* only send packets if the window is not full */
   while (!is_client_window_full (relState))
   {
+    /* do not read anything from input if: 1) the client is finished transmitting data, OR 
+       2) an EOF packet is in flight. */ 
+    if (is_client_finished (relState) || is_EOF_in_flight (relState))
+      return;
+
     /* try to read from input and create a packet */
     packet_t *packet = create_packet_from_input (relState);
 
