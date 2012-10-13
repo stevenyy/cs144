@@ -676,9 +676,9 @@ process_ack (rel_t *relState, packet_t *packet)
   /* delete acked packets from in-flight packet list and update client state accordingly */
   delete_acked_packets (relState, packet->ackno);
 
-  /* received ack for EOF packet: destroy the connection if the other side's client has 
-     finished transmitting. */
-  if (is_EOF_in_flight (relState) && (packet->ackno - 1 == relState->clientState.EOFseqno))
+  /* if we received ack for EOF packet and our client is in FINISHED state destroy the connection 
+     if the other side's client has finished transmitting. */
+  if (is_client_finished (relState))
   {
     if (relState->serverState == SERVER_FINISHED)
       rel_destroy (relState);
