@@ -25,6 +25,8 @@
 #define TRUE 1
 #define FALSE 0
 
+int count = 0; // TODO remove before submission
+
 /* Wrapper struct around packet_t with extra information useful for retransmission. */
 struct packet_record {
   /* This pointer must be the first field in order for linked list generic function to work */
@@ -441,6 +443,12 @@ process_received_ack_packet (rel_t *relState, struct ack_packet *packet)
 void 
 process_received_data_packet (rel_t *relState, packet_t *packet)
 {
+  // TODO: remove before submission
+  if (count % 5 == 0)
+  {
+    count++;
+    return;
+  }
   /* Server piece should process the data part of the packet and client piece
      should process part the ack part of the packet. */  
 
@@ -777,7 +785,6 @@ delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno)
   uint32_t latestAckedSeqno = ackno - 1;
 
   packet_record_t **head = &(relState->clientState.headPacketsInFlightList);
-  packet_record_t **tail = &(relState->clientState.tailPacketsInFlightList);
 
   /* keep deleting packets whose sequence number is less than or equal to 
      the latestAckedSeqno */
@@ -788,10 +795,6 @@ delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno)
     *head = (*head)->next;
 
     free(toDelete);
-
-    /* edge case: when we remove the last element we need to set the tail to point to NULL*/
-    if (*head == NULL)
-      *tail = NULL;
   }
 }
 
