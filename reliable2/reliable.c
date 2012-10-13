@@ -673,25 +673,21 @@ process_ack (rel_t *relState, packet_t *packet)
   if (!is_valid_ackno (relState, packet->ackno))
     return;
 
-  /* received ack for EOF packet: update client state to declare finished 
-     connection, free all memory allocated to in-flight list, and destroy the connection
-     if appropriate */
-  if (is_EOF_in_flight (relState) && (packet->ackno == relState->clientState.EOFseqno))
-  {
-    delete_acked_packets (relState, packet->ackno);
+  /* delete acked packets from in-flight packet list and update client state accordingly */
+  delete_acked_packets (relState, packet->ackno);
 
-    /* destroy the connection only if the other side's client has finished transmitting */
+  /* received ack for EOF packet: destroy the connection if the other side's client has 
+     finished transmitting. */
+  if (is_EOF_in_flight (relState) && (packet->ackno - 1 == relState->clientState.EOFseqno))
+  {
     if (relState->serverState == SERVER_FINISHED)
       rel_destroy (relState);
   }
 
-  /* received ack for a non-EOF packet: slide window, update client state accordingly, 
-     delete acked packets from in-flight list, and try to read from input */
+  /* received ack for a non-EOF packet. now there is room in the window for sending packets,
+     try to read from input */
   else 
-  {  
-    delete_acked_packets (relState, packet->ackno);
     rel_read (relState); // TODO: BUG_RISK think this through
-  }
 }
 
 /*
@@ -759,13 +755,12 @@ update_client_state_on_deletion (rel_t *relState, uint32_t ackno)
 
   if (is_EOF_in_flight (relState))
   {
-    /* if EOF packet was acked then turn isEOFinFlight flag off. */
+    /* received ack for EOF-packet, declare connection finished on client side and turn isEOFinFlight flag off. */
     if (relState->clientState.EOFseqno <= latestAckedSeqno)
+    {
       relState->clientState.isEOFinFlight = FALSE;
-
-    /* received ack for EOF-packet, declare connection finished on client side */
-    if (ackno == relState->clientState.EOFseqno)
       relState->clientState.isFinished = TRUE;
+    }
   }
 }
 
