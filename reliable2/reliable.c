@@ -69,6 +69,7 @@ struct client_state {
   int isEOFinFlight;
   uint32_t EOFseqno;
   int isPartialInFlight;
+  uint32_t partialSeqno;
 
   // for debugging
   int numPartialsInFlight; // TODO: delete for submission
@@ -142,11 +143,16 @@ void send_full_packet_only (rel_t *relState, packet_t *packet);
 int is_partial_packet_in_flight (rel_t *relState);
 int is_client_finished (rel_t *relState);
 int is_EOF_in_flight (rel_t *relState);
-int is_window_full (rel_t *relState);
+int is_client_window_full (rel_t *relState);
+int have_packets_in_flight (rel_t *relState);
 packet_record_t *create_packet_record (packet_t *packet, int packetLength, uint32_t seqno);
 void save_to_in_flight_list (rel_t *relState, packet_record_t *packetRecord);
 void append_to_list (node_t **head, node_t **tail, node_t *newNode);
-void update_client_state (rel_t *relState, packet_record_t *packetRecord);
+void update_client_state_on_addition (rel_t *relState, packet_record_t *packetRecord);
+void delete_acked_packets (rel_t *relState, uint32_t ackno);
+void delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno);
+void update_client_state_on_deletion (rel_t *relState, uint32_t ackno);
+int is_valid_ackno (rel_t *relState, uint32_t ackno);
 
 // TODO delete function for submission
 void abort_if (int expression, char *msg);
@@ -197,7 +203,8 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   r->clientState.isEOFinFlight = FALSE;
   r->clientState.EOFseqno = 0; // TODO: this is semantically incorrect but it should be OK
   r->clientState.isPartialInFlight = FALSE;
-
+  r->clientState.partialSeqno = 0; // TODO: this is semantically incorrect but it should be OK
+  
   r->clientState.numPartialsInFlight = 0; // TODO: delete for submission
   
   /* Server initialization */
@@ -264,7 +271,7 @@ rel_read (rel_t *relState)
     return;
 
   /* the window is not full, so there is room to send packets */
-  while (!is_window_full (relState))
+  while (!is_client_window_full (relState))
   {
     /* try to read from input and create a packet */
     packet_t *packet = create_packet_from_input (relState);
@@ -442,40 +449,6 @@ process_received_data_packet (rel_t *relState, packet_t *packet)
   process_ack (relState, packet);
 }
 
-/*
-  This function processes received ack only packets which have passed the corruption check. 
-  NOTE: this function works for data packets as well as ack only packets, i.e. packet
-  could really be a packet_t* or a struct ack_packet*.
-  NOTE: This functionality belongs to the client piece.  
-*/
-void 
-process_ack (rel_t *relState, packet_t *packet)
-{
-  /* proceed only if we are waiting for an ack */ 
-  if (relState->clientState == WAITING_ACK)
-  {
-    /* received ack for last normal packet sent, go back to waiting for input 
-       and try to read */
-    if (packet->ackno == relState->seqnoLastPacketSent + 1)
-    {
-      relState->clientState = WAITING_INPUT_DATA;
-      rel_read (relState);
-    }
-  }
-  else if (relState->clientState == WAITING_EOF_ACK)
-  {
-    /* received ack for EOF packet, enter declare client connection to be finished */
-    if (packet->ackno == relState->seqnoLastPacketSent + 1)
-    {
-      relState->clientState = CLIENT_FINISHED;
-
-      /* destroy the connection only if the other side's client has finished transmitting */
-      if (relState->serverState == SERVER_FINISHED)
-        rel_destroy (relState);
-    } 
-  }
-}
-
 /* 
   This function processes a data packet.
   NOTE: This functionality belongs to the server piece. 
@@ -651,7 +624,152 @@ create_ack_packet (uint32_t ackno)
 
 
 
-// TODO comment
+
+
+
+/*
+  This function processes received ack only packets which have passed the corruption check. 
+  NOTE: this function works for data packets as well as ack only packets, i.e. packet
+  could really be a packet_t* or a struct ack_packet*.
+  NOTE: This functionality belongs to the client piece.  
+*/
+void 
+process_ack (rel_t *relState, packet_t *packet)
+{
+  /* proceed only if we are waiting for an ack (i.e. we have packets in flight) 
+     and the client has not finished */ 
+  if (!have_packets_in_flight (relState) || is_client_finished (relState))
+    return;
+
+  /* discard the ack if the ackno is for a packet that: 1) has been previously 
+    acked, OR 2) we have not sent, OR 3) not within our window */
+  if (!is_valid_ackno (relState, packet->ackno))
+    return;
+
+  /* received ack for EOF packet: update client state to declare finished 
+     connection, free all memory allocated to in-flight list, and destroy the connection
+     if appropriate */
+  if (is_EOF_in_flight (relState) && (packet->ackno == relState->clientState.EOFseqno))
+  {
+    delete_acked_packets (relState, packet->ackno);
+
+    /* destroy the connection only if the other side's client has finished transmitting */
+    if (relState->serverState == SERVER_FINISHED)
+      rel_destroy (relState);
+  }
+
+  /* received ack for a non-EOF packet: slide window, update client state accordingly, 
+     delete acked packets from in-flight list, and try to read from input */
+  else 
+  {  
+    delete_acked_packets (relState, packet->ackno);
+    rel_read (relState); // TODO: BUG_RISK think this through
+  }
+}
+
+/*
+  Function takes an ack number for a received ack packet and determines if the 
+  ackno corresponds to packets currently in flight. 
+  NOTE: this functionality belongs to the client piece. 
+*/
+int 
+is_valid_ackno (rel_t *relState, uint32_t ackno)
+{
+  /* ackno is for packets that have previously been acked, so it's not valid */
+  if (ackno <= relState->clientState.lastAckedSeqno + 1)
+    return FALSE;
+  /* ackno is for packets that have not yet been sent, so it's not valid */
+  else if (ackno > relState->clientState.lastSentSeqno + 1)
+    return FALSE;
+  /* the remaining option is that the ackno is for packets we have sent and
+     have not yet been acknowledged, so the ackno is valid */
+  else 
+    return TRUE;
+}
+
+/* 
+  This function takes a valid ackno for the last acked packet, updates the clientState
+  and deletes all acked packets from the in-flight packet list. 
+  NOTE: this function belongs to the client piece. 
+*/
+void 
+delete_acked_packets (rel_t *relState, uint32_t ackno)
+{
+  update_client_state_on_deletion (relState, ackno);
+  delete_acked_packets_from_in_flight_list (relState, ackno);
+}
+
+/*
+  This function updates the state of the client when acked packet_record(s) is/are 
+  deleted from the in-flight packet list. It takes an ackno for the last acked 
+  packet and updates the clientState fields accordingly, except for linked list pointers.
+  NOTE: this function belongs to the client piece. 
+*/
+void 
+update_client_state_on_deletion (rel_t *relState, uint32_t ackno)
+{
+  /* ackno is the number of next expected packet, so ackno - 1 
+     is the seqno of the last acked packet */
+  int latestAckedSeqno = ackno - 1; 
+  int numPacketsAcked = latestAckedSeqno - relState->clientState.lastAckedSeqno;
+
+  /* slide window */
+  relState->clientState.lastAckedSeqno = latestAckedSeqno;
+  relState->clientState.numPacketsInFlight -= numPacketsAcked;
+
+  if (is_partial_packet_in_flight (relState))
+  {
+    /* if partial packet was acked then turn isPartialInFlight flag off. */
+    if (relState->clientState.partialSeqno <= latestAckedSeqno)
+    {
+      relState->clientState.isPartialInFlight = FALSE;
+      
+      // TODO: delete before submission
+      relState->clientState.numPartialsInFlight -= 1;
+      abort_if(relState->clientState.numPartialsInFlight != 0, "in update_client_state_on_deletion: numPartialsInFlight is not 0 after acking an in-flight partial packet"); 
+    }
+  }
+
+  if (is_EOF_in_flight (relState))
+  {
+    /* if EOF packet was acked then turn isEOFinFlight flag off. */
+    if (relState->clientState.EOFseqno <= latestAckedSeqno)
+      relState->clientState.isEOFinFlight = FALSE;
+
+    /* received ack for EOF-packet, declare connection finished on client side */
+    if (ackno == relState->clientState.EOFseqno)
+      relState->clientState.isFinished = TRUE;
+  }
+}
+
+// TODO: comment
+void 
+delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno)
+{
+  /* all packets with seqno <= akno - 1 have been acknowledged and must be deleted */
+  uint32_t latestAckedSeqno = ackno - 1;
+
+  packet_record_t **head = &(relState->clientState.headPacketsInFlightList);
+
+  /* keep deleting packets whose sequence number is less than or equal to 
+     the latestAckedSeqno */
+  while((*head != NULL) && ((*head)->seqno <= latestAckedSeqno))
+  {
+    /* remove first element fromn linked list */
+    packet_record_t *toDelete = *head;
+    *head = (*head)->next;
+
+    free(toDelete);
+  }
+}
+
+
+/*
+  This function takes a packet (with full or partial payload) to be sent, 
+  prepares it for transmission, sends it via conn_sendpkt, and saves a record
+  in the in-flight packet list.
+  NOTE: this funcionatlity belongs to the client piece.  
+*/
 void
 send_full_or_partial_packet (rel_t *relState, packet_t *packet)
 {
@@ -686,6 +804,7 @@ send_full_packet_only (rel_t *relState, packet_t *packet)
   - This function does not compute/write the cksum field of the packet. This 
     should be done when the packet is to be transmitted over UDP only after 
     converting all necessary fields to network byte order. 
+  - This function belongs to the client piece.
 */
 packet_t *
 create_packet_from_input (rel_t *relState)
@@ -708,7 +827,7 @@ create_packet_from_input (rel_t *relState)
      that should be declared in the len field */
   packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
                                     (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
-  packet->ackno = (uint32_t) 0; /* not piggybacking acks, don't ack any packets */
+  packet->ackno = (uint32_t) 1; /* not piggybacking acks, don't ack any packets */
   packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1); // BUG_RISK +- 1 error
 
   return packet;
@@ -733,7 +852,8 @@ int
 is_partial_packet_in_flight (rel_t *relState)
 {
   // TODO: delete for submission
-  abort_if(relState->clientState.numPartialsInFlight > 1 || relState->clientState.numPartialsInFlight < 0, "in is_partial_packet_in_flight: more than 1 packet in flight.")
+  abort_if (relState->clientState.numPartialsInFlight > 1 || relState->clientState.numPartialsInFlight < 0, "in is_partial_packet_in_flight: more than 1 or less than 0 packets in flight.");
+  
   return relState->clientState.isPartialInFlight;
 }
 
@@ -750,17 +870,37 @@ is_EOF_in_flight (rel_t *relState)
 }
 
 int 
-is_window_full (rel_t *relState)
+is_client_window_full (rel_t *relState)
 {
   int numPacketsInFlight = relState->clientState.numPacketsInFlight;
   int windowSize = relState->clientState.windowSize;
   
   // TODO clean up after testing & before submission
-  if (numPacketsInFlight < windowSize && numPacketsInFlight >= 0)
-    return 0;
+  if (numPacketsInFlight >= 0 && numPacketsInFlight < windowSize)
+    return FALSE;
   else if (numPacketsInFlight == windowSize)
-    return 1;
-  else abort_if (TRUE, "in is_window_full: numPacketsInFlight < 0 or > windowSize");
+    return TRUE;
+
+  // TODO: delete below before submission
+  else abort_if (TRUE, "in is_client_window_full: numPacketsInFlight < 0 or > windowSize");
+  return TRUE;
+}
+
+int 
+have_packets_in_flight (rel_t *relState)
+{
+  int numPacketsInFlight = relState->clientState.numPacketsInFlight;
+  int windowSize = relState->clientState.windowSize;
+  
+  // TODO clean up after testing & before submission
+  if (numPacketsInFlight == 0)
+    return FALSE;
+  else if (numPacketsInFlight > 0 && numPacketsInFlight <= windowSize)
+    return TRUE;
+
+  // TODO: delete below before submission
+  else abort_if (TRUE, "in have_packets_in_flight: numPacketsInFlight < 0 or > windowSize");
+  return FALSE;
 }
 
 /* 
@@ -788,26 +928,27 @@ create_packet_record (packet_t *packet, int packetLength, uint32_t seqno)
 /*
   This function takes in a packet_record for a packet that has just been
   sent, updates the clientState accordingly and appends it to the linked
-  list of packets in flight.  
+  list of packets in flight.
+  NOTE: this function belongs to the client piece. 
 */
 void 
 save_to_in_flight_list (rel_t *relState, packet_record_t *packetRecord)
 {  
-  update_client_state (relState, packetRecord);
+  update_client_state_on_addition (relState, packetRecord);
   append_to_list ((node_t **) &(relState->clientState.headPacketsInFlightList), 
                   (node_t **) &(relState->clientState.tailPacketsInFlightList),
                   (node_t *) packetRecord);
 }
 
 /*
-  This function takes a packet_record_t to be stored in the linked list of packets
-  in flight and updates the clientState fields accordingly, except for linked list pointers.
+  This function updates the state of the client when a packet_record is added to the 
+  in-flight packet list. It takes a packet_record_t to be stored in the linked list
+  of packets in flight and updates the clientState fields accordingly, except for 
+  linked list pointers.
   NOTE: this function belongs to the client piece. 
-  // TODO: update_client_state is also a name for the function that updates client
-  state if a node is deleted. change name or incorporate functionality. 
 */
 void 
-update_client_state (rel_t *relState, packet_record_t *packetRecord)
+update_client_state_on_addition (rel_t *relState, packet_record_t *packetRecord)
 {
   int packetLength = packetRecord->packetLength;
 
@@ -820,14 +961,17 @@ update_client_state (rel_t *relState, packet_record_t *packetRecord)
   }
   else if (packetLength > EOF_PACKET_SIZE && packetLength < PACKET_MAX_SIZE)
   {
-    relState->clientState.isEOFinFlight = FALSE;
+    // TODO: delete before submission
+    abort_if (relState->clientState.isEOFinFlight, "in update_client_state_on_addition: isEOFinFlight is true and we have a new packet being created behind."); 
+    
     relState->clientState.isPartialInFlight = TRUE;
+    relState->clientState.partialSeqno = packetRecord->seqno;
 
     relState->clientState.numPartialsInFlight += 1; // TODO: delete for submission
   }
 
   // TODO delete for submission
-  abort_if(packetLength < EOF_PACKET_SIZE || packetLength > PACKET_MAX_SIZE, "In update_client_state, packet with wrong length");
+  abort_if (packetLength < EOF_PACKET_SIZE || packetLength > PACKET_MAX_SIZE, "In update_client_state_on_addition, packet with wrong length");
 }
 
 /*
@@ -852,7 +996,7 @@ append_to_list (node_t **head, node_t **tail, node_t *newNode)
   {  
     // BUG_RISK
     (*tail)->next = newNode; /* point 'next' pointer of last node in the list to newNode */
-    *tail = newNode /* point tail to newNode */
+    *tail = newNode; /* point tail to newNode */
   }
 }
 
@@ -862,7 +1006,7 @@ abort_if (int expression, char *msg)
 {
   if (expression)
   {
-    fprintf (stderr, msg);
+    fprintf (stderr, "%s", msg);
     abort ();
   }  
 }
