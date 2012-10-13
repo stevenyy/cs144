@@ -113,7 +113,7 @@ rel_t *rel_list;
 packet_t *create_packet_from_input (rel_t *relState);
 void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
 void handle_retransmission (rel_t *relState);
-int get_time_since_last_transmission (rel_t *relState);
+int get_time_since_last_transmission (packet_record_t *packet_record);
 void save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength, uint32_t seqno);
 
 /* Helper functions for server piece */
@@ -153,6 +153,8 @@ void delete_acked_packets (rel_t *relState, uint32_t ackno);
 void delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno);
 void update_client_state_on_deletion (rel_t *relState, uint32_t ackno);
 int is_valid_ackno (rel_t *relState, uint32_t ackno);
+void retransmit_packet_if_necessary (rel_t *relState, packet_record_t *packet_record);
+
 
 // TODO delete function for submission
 void abort_if (int expression, char *msg);
@@ -473,7 +475,7 @@ process_data_packet (rel_t *relState, packet_t *packet)
       create_and_send_ack_packet (relState, packet->seqno + 1);
 
       /* destroy the connection only if our client has finished transmitting */
-      if (relState->clientState == CLIENT_FINISHED)
+      if (is_client_finished (relState))
         rel_destroy (relState);      
     }
     /* we receive a non-EOF data packet, so try to flush it to conn_output */
@@ -540,41 +542,6 @@ flush_payload_to_output (rel_t *relState)
   return 0;
 }
 
-/* 
-  This function checks to see if there are any expired timeouts for unacknowledged packets
-  and retransmits accordingly. 
-*/
-void 
-handle_retransmission (rel_t *relState)
-{
-  /* Only retransmit if we are waiting for acks */
-  if (relState->clientState == WAITING_ACK || relState->clientState == WAITING_EOF_ACK)
-  {
-    int millisecondsSinceTransmission = get_time_since_last_transmission (relState);
-
-    /* last transmission timed out, retransmit last packet*/
-    if (millisecondsSinceTransmission > relState->timeout) 
-    {
-      conn_sendpkt (relState->c, &(relState->lastPacketSent), relState->lengthLastPacketSent);
-      gettimeofday (&(relState->lastTransmissionTime), NULL); /* record retransmission time */
-    }
-  }
-}
-
-/*
-  This function returns the time interval, in milliseconds, between the time the last packet 
-  was transmitted and now. 
-*/
-int 
-get_time_since_last_transmission (rel_t *relState)
-{
-  struct timeval now;
-  gettimeofday (&now, NULL);
-  
-  return ( ( (int)now.tv_sec * 1000 + (int)now.tv_usec / 1000 ) - 
-  ( (int)relState->lastTransmissionTime.tv_sec * 1000 + (int)relState->lastTransmissionTime.tv_usec / 1000 ) );
-}
-
 void
 create_and_send_ack_packet (rel_t *relState, uint32_t ackno)
 {
@@ -626,6 +593,66 @@ create_ack_packet (uint32_t ackno)
 
 
 
+
+
+
+
+
+
+
+/* 
+  This function checks to see if there are any expired timeouts for unacknowledged packets
+  and retransmits accordingly. 
+  NOTE: this functionality belongs to the client piece.
+*/
+void 
+handle_retransmission (rel_t *relState)
+{
+  /* proceed only if we are waiting for an ack (i.e. we have packets in flight) 
+     and the client has not finished */ 
+  if (!have_packets_in_flight (relState) || is_client_finished (relState))
+    return;
+
+  /* iterate over all packets currently in flight and retransmit selectively if their timeout has expired */
+  packet_record_t *packet_record_ptr = relState->clientState.headPacketsInFlightList;
+
+  while (packet_record_ptr != NULL)
+  {
+    retransmit_packet_if_necessary (relState, packet_record_ptr);
+    packet_record_ptr = packet_record_ptr->next;
+  }
+}
+
+/*
+  This function takes a packet_record, inspects its last time of transmission and retransmits
+  the packet if it has timed out. 
+*/
+void 
+retransmit_packet_if_necessary (rel_t *relState, packet_record_t *packet_record)
+{
+  int millisecondsSinceLastTransmission = get_time_since_last_transmission (packet_record);
+
+  /* if timeout expired, retransmit last packet*/
+  if (millisecondsSinceLastTransmission > relState->timeout) 
+  {
+    conn_sendpkt (relState->c, &(packet_record->packet), packet_record->packetLength);
+    gettimeofday (&(packet_record->lastTransmissionTime), NULL); /* record retransmission time */
+  }
+}
+
+/*
+  This function returns the time interval, in milliseconds, between the time the last packet 
+  was transmitted and now. 
+*/
+int 
+get_time_since_last_transmission (packet_record_t *packet_record)
+{
+  struct timeval now;
+  gettimeofday (&now, NULL);
+  
+  return ( ( (int)now.tv_sec * 1000 + (int)now.tv_usec / 1000 ) - 
+  ( (int)packet_record->lastTransmissionTime.tv_sec * 1000 + (int)packet_record->lastTransmissionTime.tv_usec / 1000 ) );
+}
 
 /*
   This function processes received ack only packets which have passed the corruption check. 
@@ -753,7 +780,7 @@ delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno)
 
   /* keep deleting packets whose sequence number is less than or equal to 
      the latestAckedSeqno */
-  while((*head != NULL) && ((*head)->seqno <= latestAckedSeqno))
+  while ((*head != NULL) && ((*head)->seqno <= latestAckedSeqno))
   {
     /* remove first element fromn linked list */
     packet_record_t *toDelete = *head;
