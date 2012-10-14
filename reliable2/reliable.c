@@ -39,6 +39,7 @@ struct packet_record {
 };
 typedef struct packet_record packet_record_t;
 
+
 /* 
   This is a structure for a generic node in a singly linked list. 
   It is used by functions which manipulate generic linked lists for 
@@ -53,28 +54,27 @@ typedef struct node node_t;
 
 
 struct client_state {
-  int windowSize; /* SWS */
-  uint32_t lastAckedSeqno; /* LAR */
-  uint32_t lastSentSeqno; /* LSS */
-  /* client must maintain invariant LSS - LAR <= SWS */
-
-  int numPacketsInFlight;
-  /* head and tail pointers to linked list of packets in flight */ 
+  /* state for linked list of packets in flight */ 
   packet_record_t *headPacketsInFlightList;
   packet_record_t *tailPacketsInFlightList; 
-  
-  int isFinished; /* has client finished sending data? (i.e. sent and received an ack for EOF packet)*/
-
-  /* Extra state for convenience */
+  int numPacketsInFlight;
   int isEOFinFlight;
   uint32_t EOFseqno;
   int isPartialInFlight;
   uint32_t partialSeqno;
+  int numPartialsInFlight; // TODO: for debugging, delete for submission  
+  int windowSize; /* SWS */
+  uint32_t lastAckedSeqno; /* LAR */
+  uint32_t lastSentSeqno; /* LSS */
+  
+  /* Buffer in case Nagle forces to buffer a partial packet */
+  uint8_t partialPayloadBuffer[PAYLOAD_MAX_SIZE]; /* store only the packet's payload */
+  uint16_t bufferLength; /* how many bytes used in the buffer */
 
-  // for debugging
-  int numPartialsInFlight; // TODO: delete for submission
+  int isFinished; /* has client finished sending data? (i.e. sent and received an ack for EOF packet)*/
 };
 typedef struct client_state client_state_t; 
+
 
 enum server_state{
   WAITING_DATA_PACKET, WAITING_TO_FLUSH_DATA, SERVER_FINISHED
@@ -110,7 +110,7 @@ rel_t *rel_list;
 
 /* Helper functions for client piece */
 
-packet_t *create_packet_from_input (rel_t *relState);
+packet_t *create_packet (rel_t *relState);
 void process_received_ack_packet (rel_t *relState, struct ack_packet *packet);
 void handle_retransmission (rel_t *relState);
 int get_time_since_last_transmission (packet_record_t *packet_record);
@@ -138,7 +138,7 @@ void process_ack (rel_t *relState, packet_t *packet_t);
 
 /* TODO: remove next comment. */
 /* new helper functions for lab2 */
-void send_full_or_partial_packet (rel_t *relState, packet_t *packet);
+void send_packet (rel_t *relState, packet_t *packet);
 void send_full_packet_only (rel_t *relState, packet_t *packet);
 int is_partial_packet_in_flight (rel_t *relState);
 int is_client_finished (rel_t *relState);
@@ -154,6 +154,10 @@ void delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno);
 void update_client_state_on_deletion (rel_t *relState, uint32_t ackno);
 int is_valid_ackno (rel_t *relState, uint32_t ackno);
 void retransmit_packet_if_necessary (rel_t *relState, packet_record_t *packet_record);
+packet_t *create_packet_from_buffer_and_input (rel_t *relState);
+packet_t *create_packet_from_input (rel_t *relState);
+int havePartialPayloadBuffered (rel_t *relState);
+
 
 
 // TODO delete function for submission
@@ -206,6 +210,7 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   r->clientState.EOFseqno = 0; // TODO: this is semantically incorrect but it should be OK
   r->clientState.isPartialInFlight = FALSE;
   r->clientState.partialSeqno = 0; // TODO: this is semantically incorrect but it should be OK
+  r->clientState.bufferLength = 0;
   
   r->clientState.numPartialsInFlight = 0; // TODO: delete for submission
   
@@ -275,34 +280,28 @@ rel_read (rel_t *relState)
     if (is_client_finished (relState) || is_EOF_in_flight (relState))
       return;
 
-    /* try to read from input and create a packet */
-    packet_t *packet = create_packet_from_input (relState);
+    packet_t *packet = create_packet (relState);
 
     /* if packet is NULL then there was no more data available from the input and no packet 
        was allocated. In this case stop sending packets and return. */ 
     if (packet == NULL)
       return;
 
-    // TODO: delete when implementing Nagle
-    send_full_or_partial_packet (relState, packet);
-    
     /* Otherwise a packet was created, so proceed to process it and try to send. */
 
     /* Case 1: all packets in flight carry full payload. 
        In this case we can send either a packet with full or partial payload if there 
        is any input data available. */
-       // TODO: uncomment when Nagle is implemented
-    // if (!is_partial_packet_in_flight (relState))
-    //   send_full_or_partial_packet (relState, packet);
+    if (!is_partial_packet_in_flight (relState))
+      send_packet (relState, packet);
     
     /* Case 2: there is a partially filled packet in flight.
        In this case we can only send a packet if it has a full payload. If not enough 
        data is available from the input we will buffer the partial payload until either
        the partial packet in flight is acked or we get enough data from the input to form 
        a full packet. */
-       // TODO: uncomment when Nagle is implemented. 
-    // else
-    //   send_full_packet_only (relState, packet);
+    else
+      send_full_packet_only (relState, packet);
 
     free (packet);    
   }
@@ -798,7 +797,7 @@ delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno)
   NOTE: this funcionatlity belongs to the client piece.  
 */
 void
-send_full_or_partial_packet (rel_t *relState, packet_t *packet)
+send_packet (rel_t *relState, packet_t *packet)
 {
   int packetLength = packet->len;
   uint32_t seqno = packet->seqno;
@@ -811,11 +810,49 @@ send_full_or_partial_packet (rel_t *relState, packet_t *packet)
   save_outgoing_data_packet (relState, packet, packetLength, seqno);
 }
 
-// TODO comment
+/* 
+  This function is call to try to send a packet while we have a partial packet
+  in flight. Per Nagle's algorithm we shoud only send a packet if it has a full
+  payload. Otherwise, we buffer the payload and wait until we either get enough
+  data from the input to form a full payload or the partial packet in flight is
+  acked. 
+  NOTE: this functionality belongs to the client piece. 
+*/
 void 
 send_full_packet_only (rel_t *relState, packet_t *packet)
 {
-  // TODO: implement
+  /* Only send the packet if it has a full payload, per Nagle's algorithm */ 
+  if (packet->len == PACKET_MAX_SIZE)
+    send_packet (relState, packet);
+
+  /* otherwise we buffer the packet's payload */ 
+  // TODO: continue
+
+}
+
+/* 
+  This function is called from rel_read to create a packet. 
+  The function will use any buffered partial payload and/or
+  data provided by conn_input.
+  NOTES: 
+  - In case a packet is created, this function returns allocated memory
+    for the packet which the caller should free.
+  - The packets returned do not have a valid cksum field of the packet. This 
+    should be done when the packet is to be transmitted over UDP only after 
+    converting all necessary fields to network byte order. 
+  - This functionality belongs to the client piece. 
+*/
+packet_t *
+create_packet (rel_t *relState)
+{
+  packet_t *packet;
+  
+  if (havePartialPayloadBuffered (relState))
+    packet = create_packet_from_buffer_and_input (relState);
+  else
+    packet = create_packet_from_input (relState);
+
+  return packet;
 }
 
 /* 
@@ -826,17 +863,11 @@ send_full_packet_only (rel_t *relState, packet_t *packet)
   - The function will try to read data from conn_input, if there is no input
     available (conn_input returns 0) the function will not create a packet and will 
     return NULL.
-  - In case a packet is created, this function allocates memory for the packet
-    which the caller should free.
-  - This function does not compute/write the cksum field of the packet. This 
-    should be done when the packet is to be transmitted over UDP only after 
-    converting all necessary fields to network byte order. 
   - This function belongs to the client piece.
 */
 packet_t *
 create_packet_from_input (rel_t *relState)
 {
-  // BUG_RISK 
   packet_t *packet;
   packet = xmalloc (sizeof (*packet));
 
@@ -855,11 +886,43 @@ create_packet_from_input (rel_t *relState)
   packet->len = (bytesRead == -1) ? (uint16_t) PACKET_HEADER_SIZE : 
                                     (uint16_t) (PACKET_HEADER_SIZE + bytesRead);
   packet->ackno = (uint32_t) 1; /* not piggybacking acks, don't ack any packets */
-  packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1); // BUG_RISK +- 1 error
+  packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1); 
+
+  return packet;  
+}
+
+
+/* 
+  This function creates a packet by using buffered partial payload and 
+  data from conn_input. 
+  NOTE: this functionality belongs to the client piece.
+ */
+packet_t *
+create_packet_from_buffer_and_input (rel_t *relState)
+{
+  packet_t *packet;
+  packet = xmalloc (sizeof (*packet));
+
+  int payloadSize = 0;
+
+  /* copy buffered payload to packet */
+  memcpy (packet->data, relState->clientState.partialPayloadBuffer, relState->clientState.bufferLength);
+  payloadSize += relState->clientState.bufferLength;
+
+  /* try to fill the remaining free space in the packet's payload from the input */
+  size_t numBytesToCopy = PAYLOAD_MAX_SIZE - payloadSize;
+  int bytesRead = conn_input (relState->c, packet->data + payloadSize, numBytesToCopy);
+
+  /* if we read EOF disregard it, we first send the buffered data */
+  if (bytesRead != -1)
+    payloadSize += bytesRead;
+
+  packet->len = (uint16_t) (PACKET_HEADER_SIZE + payloadSize);
+  packet->ackno = (uint32_t) 1; /* not piggybacking acks, don't ack any packets */
+  packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1);  
 
   return packet;
 }
-
 
 /* 
   Save a copy of the last packet sent to the list of in-flight packets in case 
@@ -894,6 +957,12 @@ int
 is_EOF_in_flight (rel_t *relState)
 {
   return relState->clientState.isEOFinFlight;
+}
+
+int
+havePartialPayloadBuffered (rel_t *relState)
+{
+  return (relState->clientState.bufferLength > 0);
 }
 
 int 
