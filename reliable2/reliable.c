@@ -139,7 +139,7 @@ void process_ack (rel_t *relState, packet_t *packet_t);
 /* TODO: remove next comment. */
 /* new helper functions for lab2 */
 void send_packet (rel_t *relState, packet_t *packet);
-void send_full_packet_only (rel_t *relState, packet_t *packet);
+void send_EOF_or_full_packet_only (rel_t *relState, packet_t *packet);
 int is_partial_packet_in_flight (rel_t *relState);
 int is_client_finished (rel_t *relState);
 int is_EOF_in_flight (rel_t *relState);
@@ -301,7 +301,7 @@ rel_read (rel_t *relState)
        the partial packet in flight is acked or we get enough data from the input to form 
        a full packet. */
     else
-      send_full_packet_only (relState, packet);
+      send_EOF_or_full_packet_only (relState, packet);
 
     free (packet);    
   }
@@ -813,21 +813,24 @@ send_packet (rel_t *relState, packet_t *packet)
 /* 
   This function is call to try to send a packet while we have a partial packet
   in flight. Per Nagle's algorithm we shoud only send a packet if it has a full
-  payload. Otherwise, we buffer the payload and wait until we either get enough
-  data from the input to form a full payload or the partial packet in flight is
-  acked. 
+  payload or it's an EOF. Otherwise, we buffer the payload and wait until we either 
+  get enough data from the input to form a full payload or the partial packet in 
+  flight is acked. 
   NOTE: this functionality belongs to the client piece. 
 */
 void 
-send_full_packet_only (rel_t *relState, packet_t *packet)
+send_EOF_or_full_packet_only (rel_t *relState, packet_t *packet)
 {
   /* Only send the packet if it has a full payload, per Nagle's algorithm */ 
-  if (packet->len == PACKET_MAX_SIZE)
+  if (packet->len == PACKET_MAX_SIZE || packet->len == EOF_PACKET_SIZE)
     send_packet (relState, packet);
 
-  /* otherwise we buffer the packet's payload */ 
-  // TODO: continue
-
+  else /* otherwise we buffer the packet's payload */
+  {
+    int payloadSize = packet->len - PACKET_HEADER_SIZE; 
+    memcpy (relState->clientState.partialPayloadBuffer, packet->data, payloadSize);
+    relState->clientState.bufferLength = payloadSize;
+  }
 }
 
 /* 
@@ -920,6 +923,8 @@ create_packet_from_buffer_and_input (rel_t *relState)
   packet->len = (uint16_t) (PACKET_HEADER_SIZE + payloadSize);
   packet->ackno = (uint32_t) 1; /* not piggybacking acks, don't ack any packets */
   packet->seqno = (uint32_t) (relState->clientState.lastSentSeqno + 1);  
+
+  relState->clientState.bufferLength = 0; /* empty buffer since we have used its data in a packet */
 
   return packet;
 }
