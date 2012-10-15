@@ -3,7 +3,7 @@ SUID: rmferrer
 email: rmferrer@cs.stanford.edu
 
 CS144 
-README for Lab 1
+README for Lab 2
 
 Recall that the functionality in the assignment can be divided into two separate entities with
 two separate state machines. 1) The CLIENT is responsible for reading data from conn_input,
@@ -22,70 +22,65 @@ convert_packet_to_host_byte_order, convert_packet_to_network_byte_order, compute
 Discussion of Client Side:
 
 The following state is kept in the rel_t structure of the connection for the client:
+ 
+
+struct client_state {
+  /* state for linked list of packets in flight */ 
+  packet_record_t *headPacketsInFlightList;
+  packet_record_t *tailPacketsInFlightList; 
+  int numPacketsInFlight;
+  int isEOFinFlight;
+  uint32_t EOFseqno;
+  int isPartialInFlight;
+  uint32_t partialSeqno;
+  int numPartialsInFlight; 
+  int windowSize; /* Send Window Size (SWS) */
+  uint32_t lastAckedSeqno; /* LAR */
+  uint32_t lastSentSeqno; /* LSS; sender must maintain LSS - LAR <= SWS */
+  
+  /* Buffer in case Nagle forces to buffer a partial packet */
+  uint8_t partialPayloadBuffer[PAYLOAD_MAX_SIZE]; /* store only the packet's payload */
+  uint16_t bufferLength; /* how many bytes used in the buffer */
+
+  int isFinished; /* has client finished sending data? (i.e. sent and received an ack for EOF packet)*/
+};
+typedef struct client_state client_state_t; 
 
 
-  enum client_state clientState;
-  packet_t lastPacketSent; 
-  size_t lengthLastPacketSent; 
-  uint32_t seqnoLastPacketSent;
-  struct timeval lastTransmissionTime;
-
-The clientState keeps track of the state the client is in. We have 4 states:
-WAITING_INPUT_DATA (the client is waiting for data from input), WAITING_ACK (the client has
-sent some non-EOF data and is waiting for an ack), WAITING_EOF_ACK (the client has send an EOF
-packet and is waiting for the ACK of that packet), CLIENT_FINISHED (the client has received
-the ACK for the EOF packet it sent and has declares the connection closed). The design of the
-client is simple: the client will start in WAITING_INPUT_DATA state. The client will only ask conn_input for data only when it is in
-WAITING_INPUT_DATA state. If it is in that state it will only ask for one packet's worth of
-data and no more. The idea is that the client will not burden itself with more data that it
-can handle and will not buffer extra data that conn_input, it will let conn_input buffer the
-extra data it has. Once it has received some data from conn_input it will transition to
-WAITING_ACK or WAITING_EOF_ACK state depending on what type of data it got from the input. In
-any of these two states it will not respond to any rel_read events (i.e. it will not pay
-attention to any input available) and will only concern itseld with getting the ACK its
-expecting and retransmitting the last packet sent if necessary (in rel_timer). Thus the last
-packet sent and its transmission time are kept as part of the rel_t state of the client. The
-client will retransmit indefinitely many times until it gets the ACK it is expecting. Once it
-gets the ACK it is expecting it will either transition back to WAITING_INPUT_DATA or
-CLIENT_FINISHED state depending on whether it got an ACK for a non-EOF or EOF packet sent. At
-CLIENT_FINISHED the client will not transition out of that state any more and will not take
-any actions to any events. If it goes back to WAITING_INPUT it will after receiving an ACK for
-a non-EOF packet it will call rel_read to see if there is any data available from the input.
-At this point the client will be waiting for the next input available and will be ready to
-send the next packet. 
+The client maintains linked list of packets in flight and a few other fields to keep track of its state. 
+It also has helper functions like is_partial_packet_in_flight, is_client_finished, is_EOF_in_flight, 
+is_client_window_full, etc. which help know which state the client is in. When reading from the input the 
+client will check if the window is not full, if an EOF is not in flight and if it has not finished
+transmitting and will only create a packet then. The packet will be created from the input or from a buffer. 
+Such buffer holds partial payloads in case a partial packet is in flight (by Nagle we cannot send
+partial payloads) and will be used to create a new packet when input is available. If a partial packet
+is in flight the client will send the created packet has full payload and will buffer it in partialPayloadBuffer otherwise. If no partial packet is in flight the packet will be sent and the state will
+be updated by adding the packet to the in flight list.
+ 
 
 Discussion of Server Side:
 
-The following state is kept in the rel_t structure of the connection for the server:
+The following state is kept in the rel_t structure of the connection for the server.
   
-  enum server_state serverState;
-  uint32_t nextInOrderSeqNo; 
-  uint8_t lastReceivedPacketPayload[PAYLOAD_MAX_SIZE];
-  uint32_t lastReceivedPacketSeqno;
-  uint16_t lastReceivedPayloadSize;
-  uint16_t numFlushedBytes;
 
-The serverState field keeps track of the state the server is in. There are 3 states:
-WAITING_DATA_PACKET (the server is waiting for a data packet from the other side),
-WAITING_TO_FLUSH_DATA (the server has received some data from the other side and it is waiting
-to flush entirely it to conn_output), and SERVER_FINISHED (the server has received an EOF
-packet from the other end and has declared the connection closed). The design for the server
-code follows the following idea: the server will start in WAITING_DATA_PACKET state. The
-server will acknowledge already seen packets regardless of which state it is in. The server
-will only process incoming data packets if it is in WAITING_DATA_PACKET state. Once it is and
-it receives the data packet with the next sequence number it expects it will process the packe
-. If the packet is an EOF packet it will transition to SERVER_FINISHED state and will then on
-respond to receiving already seen packets and acknowledging them. If it receives a non-EOF
-packet it will save a copy of the packet in its rel_t structure and will proceed to try to
-flush the packet's data to conn_ouput. If it is successful flushing all data to conn_output it
-will send an ack back and will stay in WAITING_DATA_PACKET state to receive the next data
-packet. If it is not successfull flushing all data in the packet it will enter the
-WAITING_TO_FLUSH_DATA state and will wait for available space on conn_output. Once conn_output
-releases space and calls rel_output the server will try to flush the remaining data in the
-last packet received. Upon success it will return to WAITING_DATA_PACKET state and upon
-failure it will stay in the same state. The server will only return to WAITING_DATA_PACKET
-state once all data it has saved from the last packet has been flushed. 
+struct server_state {
+  /* state for linked list of packets in window that were received and are being buffered */ 
+  packet_record_t *headReceiveWindowList;
+  int windowSize; /* Receive window size (RWS) */
+  int numPacketsBuffered;
+  int lastAcceptableSeqno; /* end of window */
+  int lastReceivedSeqno; /* seqno of the last packet delivered to application */
+  int isFinished; /* has server finished receiving data? (i.e. received and outputed an EOF packet)*/
+};
+typedef struct server_state server_state_t; 
 
+
+The server side keeps a list of packets received that are within its window, i.e. between 
+lastReceivedSeqno + 1 and lastAcceptableSeqno. Packets with seqnos before this range will be acked
+and with seqnos after will be discarded. Once the server has a complete contiguous sequence of 
+packets starting at lastReceivedSeqno + 1 it will try to flush them to the output using flush_receive_window_buffer_to_output. This function basically takes all the packets in the receive
+window list that can be flushed, tries to flush them to the output and upon sucessfull flushing
+it acks them back. 
 
 Some other considerations in the code: The rel_recvpkt and rel_destroy functions are functions
 both used by the client and server sides (rel_read and rel_timer is client only, and
