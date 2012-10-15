@@ -31,8 +31,10 @@ struct packet_record {
   struct packet_record *next; 
 
   size_t packetLength;
+  uint16_t payloadSize;
   uint32_t seqno;
   struct timeval lastTransmissionTime;
+  int numFlushedBytes; /* for server. how many bytes of packet have been delivered to application */
   
   /* This is a copy of the packet as passed to conn_sendpkt (i.e. in network byte order and with checksum) */
   packet_t packet;
@@ -45,7 +47,8 @@ typedef struct packet_record packet_record_t;
   It is used by functions which manipulate generic linked lists for 
   casting (see for example append_to_list). 
   NOTE: for these generic list manipulation functions to work, nodes 
-  in the lists must have a 'next' pointer as their first field. */
+  in the lists must have a 'next' pointer as their first field. 
+*/
 struct node
 {
   struct node *next;
@@ -63,9 +66,9 @@ struct client_state {
   int isPartialInFlight;
   uint32_t partialSeqno;
   int numPartialsInFlight; // TODO: for debugging, delete for submission  
-  int windowSize; /* SWS */
+  int windowSize; /* Send Window Size (SWS) */
   uint32_t lastAckedSeqno; /* LAR */
-  uint32_t lastSentSeqno; /* LSS */
+  uint32_t lastSentSeqno; /* LSS; sender must maintain LSS - LAR <= SWS */
   
   /* Buffer in case Nagle forces to buffer a partial packet */
   uint8_t partialPayloadBuffer[PAYLOAD_MAX_SIZE]; /* store only the packet's payload */
@@ -76,10 +79,16 @@ struct client_state {
 typedef struct client_state client_state_t; 
 
 
-enum server_state{
-  WAITING_DATA_PACKET, WAITING_TO_FLUSH_DATA, SERVER_FINISHED
+struct server_state {
+  /* state for linked list of packets in window that were received and are being buffered */ 
+  packet_record_t *headReceiveWindowList;
+  int windowSize; /* Receive window size (RWS) */
+  int numPacketsBuffered;
+  int lastAcceptableSeqno; /* end of window */
+  int lastReceivedSeqno; /* seqno of the last packet delivered to application */
+  int isFinished; /* has server finished receiving data? (i.e. received and outputed an EOF packet)*/
 };
-
+typedef struct server_state server_state_t; 
 
 
 struct reliable_state {
@@ -90,17 +99,8 @@ struct reliable_state {
 
   /* Add your own data fields below this */
   int timeout;
-
-  /* State for the client */
   client_state_t clientState;
-  
-  /* State for the server */
-  enum server_state serverState;
-  uint32_t nextInOrderSeqNo; /* The sequence number of the next in-order packet we expect to receive. */
-  uint8_t lastReceivedPacketPayload[PAYLOAD_MAX_SIZE]; /* buffer for the last received packet's payload */
-  uint32_t lastReceivedPacketSeqno;
-  uint16_t lastReceivedPayloadSize; /* size of the last received packet's payload */
-  uint16_t numFlushedBytes; /* number of bytes of lastReceivedPacketPayload that have been flushed out to conn_output  */
+  server_state_t serverState;
 };
 
 rel_t *rel_list;
@@ -123,7 +123,6 @@ void process_data_packet (rel_t *relState, packet_t *packet);
 void create_and_send_ack_packet (rel_t *relState, uint32_t ackno);
 struct ack_packet *create_ack_packet (uint32_t ackno);
 void save_incoming_data_packet (rel_t *relState, packet_t *packet);
-int flush_payload_to_output (rel_t *relState);
 
 /* Helper functions shared by client and server pieces */
 
@@ -145,7 +144,7 @@ int is_client_finished (rel_t *relState);
 int is_EOF_in_flight (rel_t *relState);
 int is_client_window_full (rel_t *relState);
 int have_packets_in_flight (rel_t *relState);
-packet_record_t *create_packet_record (packet_t *packet, int packetLength, uint32_t seqno);
+packet_record_t *create_sent_packet_record (packet_t *packet, int packetLength, uint32_t seqno);
 void save_to_in_flight_list (rel_t *relState, packet_record_t *packetRecord);
 void append_to_list (node_t **head, node_t **tail, node_t *newNode);
 void update_client_state_on_addition (rel_t *relState, packet_record_t *packetRecord);
@@ -157,12 +156,24 @@ void retransmit_packet_if_necessary (rel_t *relState, packet_record_t *packet_re
 packet_t *create_packet_from_buffer_and_input (rel_t *relState);
 packet_t *create_packet_from_input (rel_t *relState);
 int havePartialPayloadBuffered (rel_t *relState);
-
-
+int is_server_finished (rel_t *relState);
+int is_receive_window_empty (rel_t *relState);
+void flush_receive_window_buffer_to_output (rel_t *relState);
+int is_packet_inside_receive_window (rel_t *relState, packet_t *packet);
+int is_packet_in_receive_window_buffer (rel_t *relState, packet_t *packet);
+packet_record_t * create_received_packet_record (packet_t *packet);
+void save_to_receive_window_list (rel_t *relState, packet_record_t *packetRecord);
+void update_server_state_on_addition (rel_t *relState, packet_record_t *packetRecord);
+void update_server_state_on_deletion (rel_t *relState, packet_record_t *packetRecord);
+void insert_in_order_into_received_window_list (rel_t *relState, packet_record_t *packetRecord);
+int is_next_packet_to_flush (rel_t *relState, packet_record_t *packetRecord);
+void delete_flushed_packet (rel_t *relState, packet_record_t *packetRecord);
+void delete_flushed_packet_from_receive_window_list (rel_t *relState, packet_record_t *packetRecord);
+int flush_payload_to_output (rel_t *relState, packet_record_t *packetRecord);
 
 // TODO delete function for submission
 void abort_if (int expression, char *msg);
-
+void print_server_state(rel_t *relState);
 
 
 
@@ -215,11 +226,12 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   r->clientState.numPartialsInFlight = 0; // TODO: delete for submission
   
   /* Server initialization */
-  r->serverState = WAITING_DATA_PACKET;
-  r->nextInOrderSeqNo = 1;
-  r->numFlushedBytes = 0;
-  r->lastReceivedPayloadSize = 0;
-  r->lastReceivedPacketSeqno = 0;
+  r->serverState.headReceiveWindowList = NULL;
+  r->serverState.windowSize = cc->window;
+  r->serverState.numPacketsBuffered = 0;
+  r->serverState.lastAcceptableSeqno = cc->window;
+  r->serverState.lastReceivedSeqno = 0;
+  r->serverState.isFinished = FALSE;
 
   return r;
 }
@@ -257,15 +269,25 @@ rel_demux (const struct config_common *cc,
 void
 rel_recvpkt (rel_t *relState, packet_t *packet, size_t receivedLength)
 {
+  fprintf(stderr, "\n\n\n\n\n\n\n\n\n In rel_recvpkt");
   if (is_packet_corrupted (packet, receivedLength)) /* do not do anything if packet is corrupted */
+  {
+    fprintf(stderr, "Dropping corrupt packet.\n");
     return;
-
+  }
   convert_packet_to_host_byte_order (packet); 
 
   if (packet->len == ACK_PACKET_SIZE)
+  {
+    fprintf(stderr, "received ack packet with ackno %d\n", packet->ackno);
     process_received_ack_packet (relState, (struct ack_packet*) packet);
+  }
   else
+  {
+    print_server_state (relState);
+    fprintf(stderr, "received data packet with seqno %d and ackno %d\n", packet->seqno, packet->ackno);
     process_received_data_packet (relState, packet);
+  }
 }
 
 
@@ -289,19 +311,21 @@ rel_read (rel_t *relState)
 
     /* Otherwise a packet was created, so proceed to process it and try to send. */
 
+    send_packet (relState, packet);
+
     /* Case 1: all packets in flight carry full payload. 
        In this case we can send either a packet with full or partial payload if there 
        is any input data available. */
-    if (!is_partial_packet_in_flight (relState))
-      send_packet (relState, packet);
+    // if (!is_partial_packet_in_flight (relState))
+    //   send_packet (relState, packet);
     
     /* Case 2: there is a partially filled packet in flight.
        In this case we can only send a packet if it has a full payload. If not enough 
        data is available from the input we will buffer the partial payload until either
        the partial packet in flight is acked or we get enough data from the input to form 
        a full packet. */
-    else
-      send_EOF_or_full_packet_only (relState, packet);
+    // else
+    //   send_EOF_or_full_packet_only (relState, packet);
 
     free (packet);    
   }
@@ -314,17 +338,12 @@ rel_read (rel_t *relState)
 void
 rel_output (rel_t *relState)
 {
-  /* continue if there was a packet that was waiting to be flushed to the output */
-  if (relState->serverState == WAITING_TO_FLUSH_DATA)
-  {
-    if (flush_payload_to_output (relState))
-    {
-      /* send ack back only after flushing ALL the packet */
-      create_and_send_ack_packet (relState, relState->lastReceivedPacketSeqno + 1);
-      relState->nextInOrderSeqNo = relState->lastReceivedPacketSeqno + 1;
-      relState->serverState = WAITING_DATA_PACKET;
-    }
-  }
+
+  fprintf(stderr, "\n\n\n\n\n\n\n\n In rel_output");
+  /* continue if there was a packet in the receive window 
+     that was waiting to be flushed to the output */
+  if (!is_server_finished (relState) && !is_receive_window_empty (relState))
+    flush_receive_window_buffer_to_output (relState);
 }
 
 void
@@ -450,97 +469,6 @@ process_received_data_packet (rel_t *relState, packet_t *packet)
   process_ack (relState, packet);
 }
 
-/* 
-  This function processes a data packet.
-  NOTE: This functionality belongs to the server piece. 
-*/ 
-void
-process_data_packet (rel_t *relState, packet_t *packet)
-{
-  /* if we receive a packet we have seen and processed before then just send an ack back
-     regardless on which state the server is in */
-  if (packet->seqno < relState->nextInOrderSeqNo)
-    create_and_send_ack_packet (relState, packet->seqno + 1);
-
-  /* if we have received the next in-order packet we were expecting and we are waiting 
-     for data packets process the packet */
-  if ( (packet->seqno == relState->nextInOrderSeqNo) && (relState->serverState == WAITING_DATA_PACKET) )
-  {
-    /* if we received an EOF packet signal to conn_output and destroy the connection if appropriate */
-    if (packet->len == EOF_PACKET_SIZE)
-    {
-      conn_output (relState->c, NULL, 0);
-      relState->serverState = SERVER_FINISHED;
-      create_and_send_ack_packet (relState, packet->seqno + 1);
-
-      /* destroy the connection only if our client has finished transmitting */
-      if (is_client_finished (relState))
-        rel_destroy (relState);      
-    }
-    /* we receive a non-EOF data packet, so try to flush it to conn_output */
-    else
-    {
-      save_incoming_data_packet (relState, packet);
-      
-      if (flush_payload_to_output (relState))
-      {
-        create_and_send_ack_packet (relState, packet->seqno + 1);
-        relState->nextInOrderSeqNo = packet->seqno + 1;
-      }
-      else
-      {
-        relState->serverState = WAITING_TO_FLUSH_DATA;
-      }
-    }
-  }
-}
-
-/* 
-  This function saves a received data packet in case we can not flush it all
-  at once and need to do it as output space becomes available. 
-  NOTE: This functionality belongs to the server piece. 
-*/
-void
-save_incoming_data_packet (rel_t *relState, packet_t *packet)
-{  
-  uint16_t payloadSize = packet->len - PACKET_HEADER_SIZE;
-
-  memcpy (&(relState->lastReceivedPacketPayload), &(packet->data), payloadSize);
-  relState->lastReceivedPayloadSize = payloadSize;
-  relState->lastReceivedPacketSeqno = packet->seqno;
-  relState->numFlushedBytes = 0;
-}
-
-/*
-  The funtion tries to flush the parts of the last received data packet that were
-  not previously flushed to the output. It returns 1 if ALL the data in the last
-  packet has been flushed to the output and 0 otherwise. 
-  NOTE: This funcionality belongs to the server piece.
-*/
-int
-flush_payload_to_output (rel_t *relState)
-{
-  size_t bufferSpace = conn_bufspace (relState->c);
-  
-  if (bufferSpace == 0)
-    return 0;
-
-  size_t bytesLeft = relState->lastReceivedPayloadSize - relState->numFlushedBytes; /* how many bytes we still have to flush */
-  size_t writeLength = (bytesLeft < bufferSpace) ? bytesLeft : bufferSpace;
-  uint8_t *payload = relState->lastReceivedPacketPayload;
-  uint16_t offset = relState->numFlushedBytes;
-
-  /* try to write writeLength bytes of unflushed data to the output */
-  int bytesWritten = conn_output (relState->c, &payload[offset], writeLength);
-
-  relState->numFlushedBytes += bytesWritten;
-
-  if (relState->numFlushedBytes == relState->lastReceivedPayloadSize)
-    return 1;
-
-  return 0;
-}
-
 void
 create_and_send_ack_packet (rel_t *relState, uint32_t ackno)
 {
@@ -569,6 +497,295 @@ create_ack_packet (uint32_t ackno)
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* 
+  This function processes a received data packet.
+  NOTE: This functionality belongs to the server piece. 
+*/ 
+void
+process_data_packet (rel_t *relState, packet_t *packet)
+{
+  /* if we receive a packet we have seen and processed before then just send an ack back
+     regardless on which state the server is in */
+  if (packet->seqno <= relState->serverState.lastReceivedSeqno)
+  {
+    fprintf(stderr, "Sending ack packet for seen packet with ackno %d \n", packet->seqno + 1);
+    create_and_send_ack_packet (relState, relState->serverState.lastReceivedSeqno + 1);
+  }
+  /* if the server has received EOF and is finished don't ack an unseen data packet */
+  if (is_server_finished (relState))
+  { 
+    fprintf(stderr, "Dropping packet with seckno %d since server is finished\n", packet->seqno);
+    return;
+  }
+
+  /* if we have received a packet inside our receive window that 
+     we have not seen/buffered before then save the packet to 
+     our receive window list and try to flush the buffered packets
+     in the receive window to the output
+  */
+  if (is_packet_inside_receive_window (relState, packet))
+  {
+    if (!is_packet_in_receive_window_buffer (relState, packet))
+      save_incoming_data_packet (relState, packet);
+    fprintf(stderr, "saved in-window data packet with seqno %d\n", packet->seqno);
+    print_server_state (relState);
+    flush_receive_window_buffer_to_output (relState);
+    print_server_state (relState);
+  }
+}
+
+void print_server_state(rel_t *relState)
+{
+  fprintf(stderr, "server state is now: numPacketsBuffered=%d, lastAcceptableSeqno=%d, lastReceivedSeqno=%d, isFinished=%d, window = {", relState->serverState.numPacketsBuffered, relState->serverState.lastAcceptableSeqno, relState->serverState.lastReceivedSeqno, relState->serverState.isFinished);
+  packet_record_t *itr = relState->serverState.headReceiveWindowList;
+  while (itr)
+  {
+    fprintf(stderr, "(%d, %d),  ", itr->seqno, itr->payloadSize==itr->numFlushedBytes);
+    itr = itr->next;
+  }
+  fprintf(stderr, "} \n");
+}
+
+int
+is_server_finished (rel_t *relState)
+{
+  return relState->serverState.isFinished;
+}
+
+int
+is_packet_inside_receive_window (rel_t *relState, packet_t *packet)
+{
+  return (packet->seqno > relState->serverState.lastReceivedSeqno) 
+    && (packet->seqno <= relState->serverState.lastAcceptableSeqno);
+}
+
+/* This function returns true if the packet passed in is already being buffered
+   by the receive window list the server maintains, otherwise returns false. 
+   NOTE: this functionality belongs to the server piece. */
+int 
+is_packet_in_receive_window_buffer (rel_t *relState, packet_t *packet)
+{
+  uint32_t seqno = packet->seqno;
+
+  packet_record_t *itr = relState->serverState.headReceiveWindowList;
+
+  while (itr)
+  {
+    if (itr->seqno == seqno)
+      return TRUE;
+    itr = itr->next;
+  }
+
+  return FALSE;
+}
+
+/* 
+  This function saves a received data packet into the receive window
+  list in case we can not flush it all at once and need to do it as 
+  output space becomes available. 
+  NOTE: This functionality belongs to the server piece. 
+*/
+void
+save_incoming_data_packet (rel_t *relState, packet_t *packet)
+{  
+  packet_record_t *packetRecord = create_received_packet_record (packet);
+  save_to_receive_window_list (relState, packetRecord);
+}
+
+void 
+save_to_receive_window_list (rel_t *relState, packet_record_t *packetRecord)
+{
+  update_server_state_on_addition (relState, packetRecord);
+  insert_in_order_into_received_window_list (relState, packetRecord);
+}
+
+void
+update_server_state_on_addition (rel_t *relState, packet_record_t *packetRecord)
+{
+  relState->serverState.numPacketsBuffered += 1;
+}
+
+void 
+insert_in_order_into_received_window_list (rel_t *relState, packet_record_t *packetRecord)
+{
+  /* TODO: comment and give credit to source */
+  packet_record_t *itr = relState->serverState.headReceiveWindowList;
+  packet_record_t **itr2 = &(relState->serverState.headReceiveWindowList);
+
+  while (itr != NULL && itr->seqno < packetRecord->seqno)
+  {
+    itr2 = &(itr->next);
+    itr = itr->next;
+  }
+
+  *itr2 = packetRecord;
+  packetRecord->next = itr;
+}
+
+/*
+  The funtion tries to flush the parts of the last received data packet that were
+  not previously flushed to the output. It returns 1 if ALL the data in the last
+  packet has been flushed to the output and 0 otherwise. 
+  NOTE: This funcionality belongs to the server piece. 
+  TODO: update comment
+*/
+void
+flush_receive_window_buffer_to_output (rel_t *relState)
+{
+  packet_record_t *packetItr = relState->serverState.headReceiveWindowList;
+  int flushedAnyPackets = FALSE;
+  
+  while (packetItr != NULL && is_next_packet_to_flush (relState, packetItr))
+  {
+    if (flush_payload_to_output (relState, packetItr))
+    {
+      fprintf(stderr, "flushed packet with seqno %d, isEOF=%d\n", packetItr->seqno, packetItr->packetLength == EOF_PACKET_SIZE);
+      flushedAnyPackets = TRUE;
+      packetItr = packetItr->next;
+    }
+    else
+    {
+      fprintf(stderr, "could not flush packet with seqno %d\n", packetItr->seqno );
+      break;
+    }
+  }
+
+  if (flushedAnyPackets)
+  {
+    fprintf(stderr, "Sending ack packet for flushed packet(s) with ackno %d \n", relState->serverState.lastReceivedSeqno + 1);
+    create_and_send_ack_packet (relState, relState->serverState.lastReceivedSeqno + 1);
+    if (is_server_finished (relState))
+    {
+      if (is_client_finished (relState))
+        rel_destroy (relState);
+    }
+  }
+}
+
+int
+is_next_packet_to_flush (rel_t *relState, packet_record_t *packetRecord)
+{
+  return packetRecord->seqno == relState->serverState.lastReceivedSeqno + 1;
+}
+
+int
+flush_payload_to_output (rel_t *relState, packet_record_t *packetRecord)
+{
+  if (packetRecord->packetLength == EOF_PACKET_SIZE)
+  {
+    conn_output (relState->c, NULL, 0);
+    delete_flushed_packet (relState, packetRecord);
+    return 1;
+  }
+
+  size_t bufferSpace = conn_bufspace (relState->c);
+  
+  if (bufferSpace == 0)
+    return 0;
+
+  size_t bytesLeft = packetRecord->payloadSize - packetRecord->numFlushedBytes; /* how many bytes we still have to flush */
+  size_t writeLength = (bytesLeft < bufferSpace) ? bytesLeft : bufferSpace;
+  char *payload = packetRecord->packet.data;
+  uint16_t offset = packetRecord->numFlushedBytes;
+
+  /* try to write writeLength bytes of unflushed data to the output */
+  int bytesWritten = conn_output (relState->c, &payload[offset], writeLength);
+
+  packetRecord->numFlushedBytes += bytesWritten;
+
+  if (packetRecord->numFlushedBytes == packetRecord->payloadSize)
+  {
+    delete_flushed_packet (relState, packetRecord);
+    return 1;
+  }
+
+  return 0;
+}
+
+void 
+delete_flushed_packet (rel_t *relState, packet_record_t *packetRecord)
+{
+  update_server_state_on_deletion (relState, packetRecord);
+  delete_flushed_packet_from_receive_window_list (relState, packetRecord);
+}
+
+void
+update_server_state_on_deletion (rel_t *relState, packet_record_t *packetRecord)
+{
+  relState->serverState.lastAcceptableSeqno += 1;
+  relState->serverState.lastReceivedSeqno += 1;
+  relState->serverState.numPacketsBuffered -= 1;
+  if (packetRecord->packetLength == EOF_PACKET_SIZE)
+    relState->serverState.isFinished = TRUE;
+}
+
+void
+delete_flushed_packet_from_receive_window_list (rel_t *relState, packet_record_t *packetRecord)
+{
+  packet_record_t *itr = relState->serverState.headReceiveWindowList;
+  packet_record_t **itr2 = &(relState->serverState.headReceiveWindowList);
+
+  while (itr != NULL && itr != packetRecord)
+  {
+    itr2 = &(itr->next);
+    itr = itr->next;
+  }
+
+  if (itr == packetRecord)
+  {
+    *itr2 = packetRecord->next;
+    free (packetRecord);
+  }
+}
+
+
+/* 
+  This function is used to create a record of a packet that was received
+  and is inside the receive window. This function creates a packet_record_t 
+  struct with a copy of the packet in host byte order. 
+  NOTE: this functionality belongs to the server piece. 
+  NOTE: this function allocates memory for the packet_record_t, this memory should
+  be freed when the packet is flushed and taken off the receive window list.
+*/
+packet_record_t *
+create_received_packet_record (packet_t *packet)
+{
+  packet_record_t *packetRecord;
+  packetRecord = xmalloc (sizeof (*packetRecord));
+
+  packetRecord->next = NULL;
+  packetRecord->packetLength = (size_t) packet->len;
+  packetRecord->payloadSize = packet->len - PACKET_HEADER_SIZE;
+  packetRecord->seqno = packet->seqno;
+  packetRecord->numFlushedBytes = 0; /* no bytes has been flushed to application layer yet */
+  memcpy (&(packetRecord->packet), packet, packet->len); 
+
+  return packetRecord;
+}
+
+int
+is_receive_window_empty (rel_t *relState)
+{
+  return relState->serverState.numPacketsBuffered == 0; 
+}
 
 
 
@@ -679,7 +896,7 @@ process_ack (rel_t *relState, packet_t *packet)
      if the other side's client has finished transmitting. */
   if (is_client_finished (relState))
   {
-    if (relState->serverState == SERVER_FINISHED)
+    if (is_server_finished (relState))
       rel_destroy (relState);
   }
 
@@ -748,7 +965,7 @@ update_client_state_on_deletion (rel_t *relState, uint32_t ackno)
       
       // TODO: delete before submission
       relState->clientState.numPartialsInFlight -= 1;
-      abort_if(relState->clientState.numPartialsInFlight != 0, "in update_client_state_on_deletion: numPartialsInFlight is not 0 after acking an in-flight partial packet"); 
+      //abort_if(relState->clientState.numPartialsInFlight != 0, "in update_client_state_on_deletion: numPartialsInFlight is not 0 after acking an in-flight partial packet"); 
     }
   }
 
@@ -799,6 +1016,8 @@ delete_acked_packets_from_in_flight_list (rel_t *relState, uint32_t ackno)
 void
 send_packet (rel_t *relState, packet_t *packet)
 {
+  fprintf(stderr, "\n\n\nSending data packet with seqno %d and ackno %d\n\n\n\n", packet->seqno, packet->ackno);
+
   int packetLength = packet->len;
   uint32_t seqno = packet->seqno;
 
@@ -848,14 +1067,15 @@ send_EOF_or_full_packet_only (rel_t *relState, packet_t *packet)
 packet_t *
 create_packet (rel_t *relState)
 {
-  packet_t *packet;
+  // packet_t *packet;
   
-  if (havePartialPayloadBuffered (relState))
-    packet = create_packet_from_buffer_and_input (relState);
-  else
-    packet = create_packet_from_input (relState);
+  // if (havePartialPayloadBuffered (relState))
+  //   packet = create_packet_from_buffer_and_input (relState);
+  // else
+  //   packet = create_packet_from_input (relState);
 
-  return packet;
+  // return packet;
+  return create_packet_from_input (relState);
 }
 
 /* 
@@ -939,7 +1159,7 @@ create_packet_from_buffer_and_input (rel_t *relState)
 void 
 save_outgoing_data_packet (rel_t *relState, packet_t *packet, int packetLength, uint32_t seqno)
 {
-  packet_record_t *packetRecord = create_packet_record (packet, packetLength, seqno);
+  packet_record_t *packetRecord = create_sent_packet_record (packet, packetLength, seqno);
   save_to_in_flight_list (relState, packetRecord);
 }
 
@@ -947,7 +1167,7 @@ int
 is_partial_packet_in_flight (rel_t *relState)
 {
   // TODO: delete for submission
-  abort_if (relState->clientState.numPartialsInFlight > 1 || relState->clientState.numPartialsInFlight < 0, "in is_partial_packet_in_flight: more than 1 or less than 0 packets in flight.");
+  //abort_if (relState->clientState.numPartialsInFlight > 1 || relState->clientState.numPartialsInFlight < 0, "in is_partial_packet_in_flight: more than 1 or less than 0 packets in flight.");
   
   return relState->clientState.isPartialInFlight;
 }
@@ -1013,7 +1233,7 @@ have_packets_in_flight (rel_t *relState)
   be freed when the packet is acked and taken off packet-in-flight list.
 */
 packet_record_t *
-create_packet_record (packet_t *packet, int packetLength, uint32_t seqno)
+create_sent_packet_record (packet_t *packet, int packetLength, uint32_t seqno)
 {
   packet_record_t *packetRecord;
   packetRecord = xmalloc (sizeof (*packetRecord));
